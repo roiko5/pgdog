@@ -337,6 +337,16 @@ pub struct User {
     /// current password from Vault and compares it to what the client
     /// provides instead of using a statically configured password.
     pub vault_path: Option<String>,
+    /// IAM role ARNs allowed to authenticate as this user via AWS STS client
+    /// authentication. Clients present a presigned STS GetCallerIdentity URL as
+    /// their password; the caller's role ARN must match one of these entries.
+    ///
+    /// **Note:** Requires `sts_server_id` to be set in the `[general]` section
+    /// of `pgdog.toml`.
+    ///
+    /// _Default:_ `[]` (STS client authentication disabled for this user)
+    #[serde(default)]
+    pub allowed_iam_arns: Vec<String>,
     /// Statement timeout.
     ///
     /// Sets the `statement_timeout` on all server connections at connection creation. This allows you to set a reasonable default for each user without modifying `postgresql.conf` or using `ALTER USER`.
