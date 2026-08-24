@@ -1,10 +1,11 @@
 //! AWS STS client authentication: presigned GetCallerIdentity URL validation.
 //!
 //! Clients present a presigned STS `GetCallerIdentity` URL as their Postgres
-//! password (the aws-iam-authenticator pattern). This module performs the
-//! pure, offline part of that handshake: syntactic validation of the
-//! presigned URL, IAM role ARN normalization and matching, and a cache of
-//! already-verified tokens. Executing the URL against STS happens elsewhere.
+//! password (the aws-iam-authenticator pattern). [`verify`] runs the whole
+//! handshake: syntactic validation of the presigned URL ([`precheck`]), a
+//! `GetCallerIdentity` round-trip to STS, IAM role ARN normalization and
+//! matching against the user's `allowed_iam_arns`, and a cache of
+//! already-verified tokens.
 
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
@@ -13,7 +14,12 @@ use aws_lc_rs::digest;
 use chrono::NaiveDateTime;
 use once_cell::sync::Lazy;
 use parking_lot::Mutex;
+use reqwest::StatusCode;
+use reqwest::header::ACCEPT;
+use reqwest::redirect;
+use serde::Deserialize;
 use thiserror::Error;
+use tracing::warn;
 use url::Url;
 
 /// Header clients must include in `X-Amz-SignedHeaders`, carrying the
@@ -25,6 +31,9 @@ const MAX_EXPIRES: u64 = 900;
 
 /// Upper bound on how long a verified token stays cached after insertion.
 const CACHE_MAX_TTL: Duration = Duration::from_secs(300);
+
+/// Total timeout for the outbound `GetCallerIdentity` request to STS.
+const STS_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Reasons a presigned STS URL fails validation before any I/O happens.
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -84,6 +93,24 @@ pub enum StsAuthError {
     /// `X-Amz-SignedHeaders` doesn't include the pgdog audience header.
     #[error("\"X-Amz-SignedHeaders\" does not include \"{SERVER_ID_HEADER}\"")]
     ServerIdHeaderNotSigned,
+
+    /// The verification request to STS couldn't be completed at all
+    /// (connect error, timeout, invalid response transport).
+    #[error("request to STS failed: {0}")]
+    RequestFailed(String),
+
+    /// STS returned a non-200 response: the signature (audience header
+    /// included) didn't validate, or the credentials expired or were revoked.
+    #[error("STS rejected the token (HTTP status {0})")]
+    StsRejected(u16),
+
+    /// The STS response body isn't a valid JSON `GetCallerIdentityResponse`.
+    #[error("STS response is not a valid GetCallerIdentityResponse: {0}")]
+    InvalidResponse(String),
+
+    /// The verified caller identity is not in the user's `allowed_iam_arns`.
+    #[error("caller identity is not in \"allowed_iam_arns\"")]
+    ArnNotAllowed,
 }
 
 /// A presigned STS URL that passed offline validation and is ready to be
@@ -284,6 +311,142 @@ pub fn normalize_arn(arn: &str) -> String {
 /// by its normalized IAM role ARN or by an exact unnormalized match.
 pub fn matches_allowed(normalized: &str, raw: &str, allowed: &[String]) -> bool {
     allowed.iter().any(|arn| arn == normalized || arn == raw)
+}
+
+/// Verify a presigned STS token end to end: offline [`precheck`], a
+/// `GetCallerIdentity` round-trip to STS, and authorization of the caller
+/// identity against the user's `allowed_iam_arns`.
+///
+/// Verified tokens are cached (keyed by the token alone), so a hit may have
+/// been inserted on behalf of a different user: cache hits skip the STS
+/// round-trip but are re-authorized against `allowed` every time.
+pub async fn verify(
+    password: &str,
+    server_id: &str,
+    allowed: &[String],
+    cache: &StsTokenCache,
+) -> Result<ValidatedStsToken, StsAuthError> {
+    if let Some(token) = cache.get(password) {
+        return if matches_allowed(&token.normalized_arn, &token.arn, allowed) {
+            Ok(token)
+        } else {
+            Err(StsAuthError::ArnNotAllowed)
+        };
+    }
+
+    let prechecked = precheck(password, server_id)?;
+    let client = http_client()?;
+    let arn = execute(&client, &prechecked).await?;
+    let normalized_arn = normalize_arn(&arn);
+
+    if !matches_allowed(&normalized_arn, &arn, allowed) {
+        return Err(StsAuthError::ArnNotAllowed);
+    }
+
+    let token = ValidatedStsToken {
+        arn,
+        normalized_arn,
+        expires_at: prechecked.expires_at(),
+    };
+    cache.insert(password, token.clone());
+
+    Ok(token)
+}
+
+/// Build the HTTP client used for STS verification requests.
+///
+/// Redirects are disabled so the request can only ever reach the
+/// prechecked URL.
+fn http_client() -> Result<reqwest::Client, StsAuthError> {
+    reqwest::Client::builder()
+        .timeout(STS_REQUEST_TIMEOUT)
+        .redirect(redirect::Policy::none())
+        .build()
+        .map_err(|err| StsAuthError::RequestFailed(err.without_url().to_string()))
+}
+
+/// Execute the `GetCallerIdentity` request for a prechecked token and
+/// return the caller ARN.
+async fn execute(
+    client: &reqwest::Client,
+    token: &PrecheckedToken,
+) -> Result<String, StsAuthError> {
+    execute_url(client, token.url().clone(), token.server_id()).await
+}
+
+/// Execute a `GetCallerIdentity` request against `url` and return the
+/// caller ARN.
+///
+/// Split from [`execute`] so tests can point it at a local mock server;
+/// production callers only ever reach it through a [`PrecheckedToken`],
+/// whose URL is pinned to a real STS endpoint (host, port and path).
+async fn execute_url(
+    client: &reqwest::Client,
+    url: Url,
+    server_id: &str,
+) -> Result<String, StsAuthError> {
+    // The URL is the client's credential: log its fingerprint, never
+    // the URL itself. `reqwest` errors embed the request URL, so it's
+    // stripped with `without_url()` before the error is surfaced.
+    let token_sha256 = token_fingerprint(url.as_str());
+
+    let response = client
+        .get(url)
+        .header(SERVER_ID_HEADER, server_id)
+        .header(ACCEPT, "application/json")
+        .send()
+        .await
+        .map_err(|err| StsAuthError::RequestFailed(err.without_url().to_string()))?;
+
+    let status = response.status();
+    if status != StatusCode::OK {
+        warn!(
+            token_sha256,
+            status = status.as_u16(),
+            "STS rejected presigned token"
+        );
+        return Err(StsAuthError::StsRejected(status.as_u16()));
+    }
+
+    let body = response
+        .text()
+        .await
+        .map_err(|err| StsAuthError::RequestFailed(err.without_url().to_string()))?;
+
+    parse_caller_identity(&body)
+}
+
+/// `GetCallerIdentity` response body as returned by STS for
+/// `Accept: application/json`.
+#[derive(Deserialize)]
+struct CallerIdentityBody {
+    #[serde(rename = "GetCallerIdentityResponse")]
+    response: CallerIdentityResponse,
+}
+
+#[derive(Deserialize)]
+struct CallerIdentityResponse {
+    #[serde(rename = "GetCallerIdentityResult")]
+    result: CallerIdentityResult,
+}
+
+#[derive(Deserialize)]
+struct CallerIdentityResult {
+    #[serde(rename = "Arn")]
+    arn: String,
+}
+
+/// Extract the caller ARN from an STS JSON `GetCallerIdentityResponse`.
+fn parse_caller_identity(body: &str) -> Result<String, StsAuthError> {
+    serde_json::from_str::<CallerIdentityBody>(body)
+        .map(|body| body.response.result.arn)
+        .map_err(|err| StsAuthError::InvalidResponse(err.to_string()))
+}
+
+/// Short SHA-256 prefix of the token, safe to log. The token itself is a
+/// live credential and must never be logged.
+fn token_fingerprint(token: &str) -> String {
+    hex::encode(&cache_key(token)[..6])
 }
 
 struct CachedValidation {
@@ -832,5 +995,218 @@ mod tests {
         let a = StsTokenCache::global() as *const _;
         let b = StsTokenCache::global() as *const _;
         assert_eq!(a, b);
+    }
+
+    // ── parse_caller_identity ───────────────────────────────────────────────
+
+    /// The JSON body STS returns for `Accept: application/json`.
+    fn caller_identity_json(arn: &str) -> String {
+        format!(
+            r#"{{"GetCallerIdentityResponse":{{"GetCallerIdentityResult":{{"Account":"123456789012","Arn":"{arn}","UserId":"AROAEXAMPLE:session"}},"ResponseMetadata":{{"RequestId":"01234567-89ab-cdef-0123-456789abcdef"}}}}}}"#
+        )
+    }
+
+    #[test]
+    fn parse_caller_identity_extracts_arn() {
+        let arn = "arn:aws:sts::123456789012:assumed-role/some-role/session";
+        assert_eq!(
+            parse_caller_identity(&caller_identity_json(arn)).unwrap(),
+            arn
+        );
+    }
+
+    #[test]
+    fn parse_caller_identity_rejects_missing_arn() {
+        let body = r#"{"GetCallerIdentityResponse":{"GetCallerIdentityResult":{"Account":"123456789012"}}}"#;
+        assert!(matches!(
+            parse_caller_identity(body).unwrap_err(),
+            StsAuthError::InvalidResponse(_)
+        ));
+    }
+
+    #[test]
+    fn parse_caller_identity_rejects_non_json_body() {
+        // STS answers in XML unless `Accept: application/json` is honored.
+        let body = "<GetCallerIdentityResponse></GetCallerIdentityResponse>";
+        assert!(matches!(
+            parse_caller_identity(body).unwrap_err(),
+            StsAuthError::InvalidResponse(_)
+        ));
+    }
+
+    // ── token_fingerprint ───────────────────────────────────────────────────
+
+    #[test]
+    fn token_fingerprint_is_sha256_prefix_not_the_token() {
+        // SHA-256 of "pgdog" starts with "fabb0925b8bb".
+        let fingerprint = token_fingerprint("pgdog");
+        assert_eq!(fingerprint, "fabb0925b8bb");
+        assert!(!fingerprint.contains("pgdog"));
+    }
+
+    // ── execute_url (mock STS) ──────────────────────────────────────────────
+
+    use wiremock::matchers::{header, method as http_method, path as http_path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn setup_tls() {
+        let _ = tokio_rustls::rustls::crypto::aws_lc_rs::default_provider().install_default();
+    }
+
+    async fn execute_against(server: &MockServer) -> Result<String, StsAuthError> {
+        setup_tls();
+        let url = Url::parse(&format!("{}/", server.uri())).unwrap();
+        let client = http_client().unwrap();
+        execute_url(&client, url, "pgdog-example").await
+    }
+
+    #[tokio::test]
+    async fn execute_url_sends_headers_and_returns_arn() {
+        let server = MockServer::start().await;
+        let arn = "arn:aws:sts::123456789012:assumed-role/some-role/session";
+
+        // The matchers enforce the request contract: GET to the presigned
+        // URL with the audience header and JSON accept header.
+        Mock::given(http_method("GET"))
+            .and(http_path("/"))
+            .and(header(SERVER_ID_HEADER, "pgdog-example"))
+            .and(header("accept", "application/json"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(caller_identity_json(arn)))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        assert_eq!(execute_against(&server).await.unwrap(), arn);
+    }
+
+    #[tokio::test]
+    async fn execute_url_maps_non_200_to_sts_rejected() {
+        let server = MockServer::start().await;
+
+        Mock::given(http_method("GET"))
+            .respond_with(ResponseTemplate::new(403).set_body_string(
+                "<ErrorResponse><Error><Code>SignatureDoesNotMatch</Code></Error></ErrorResponse>",
+            ))
+            .mount(&server)
+            .await;
+
+        assert_eq!(
+            execute_against(&server).await.unwrap_err(),
+            StsAuthError::StsRejected(403)
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_url_does_not_follow_redirects() {
+        let server = MockServer::start().await;
+
+        Mock::given(http_method("GET"))
+            .respond_with(ResponseTemplate::new(302).insert_header("location", "https://evil.com/"))
+            .mount(&server)
+            .await;
+
+        // Redirects are disabled: a 302 is a rejection, not a request
+        // to a new host.
+        assert_eq!(
+            execute_against(&server).await.unwrap_err(),
+            StsAuthError::StsRejected(302)
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_url_maps_invalid_body_to_invalid_response() {
+        let server = MockServer::start().await;
+
+        Mock::given(http_method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("not json"))
+            .mount(&server)
+            .await;
+
+        assert!(matches!(
+            execute_against(&server).await.unwrap_err(),
+            StsAuthError::InvalidResponse(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn execute_url_maps_connect_error_to_request_failed() {
+        setup_tls();
+        // Port 1 on loopback is closed: the request can't be completed.
+        let url = Url::parse("http://127.0.0.1:1/").unwrap();
+        let client = http_client().unwrap();
+
+        let err = execute_url(&client, url, "pgdog-example")
+            .await
+            .unwrap_err();
+        match err {
+            StsAuthError::RequestFailed(message) => {
+                // `reqwest` errors carry the request URL (the token);
+                // it must be stripped before the error is surfaced.
+                assert!(!message.contains("127.0.0.1"), "leaked URL: {message}");
+            }
+            other => panic!("expected RequestFailed, got {other:?}"),
+        }
+    }
+
+    // ── verify ──────────────────────────────────────────────────────────────
+
+    const ALLOWED_ROLE: &str = "arn:aws:iam::123456789012:role/some-role";
+
+    #[tokio::test]
+    async fn verify_cache_hit_skips_precheck_and_network() {
+        let cache = cache();
+        // "cached-token" isn't even a URL: a cache hit must short-circuit
+        // before precheck and before any I/O.
+        cache.insert(
+            "cached-token",
+            token(SystemTime::now() + Duration::from_secs(60)),
+        );
+
+        let validated = verify(
+            "cached-token",
+            "pgdog-example",
+            &[ALLOWED_ROLE.into()],
+            &cache,
+        )
+        .await
+        .unwrap();
+        assert_eq!(validated.normalized_arn, ALLOWED_ROLE);
+    }
+
+    #[tokio::test]
+    async fn verify_cache_hit_reauthorizes_against_callers_list() {
+        let cache = cache();
+        // Inserted on behalf of a user that allows this role...
+        cache.insert(
+            "cross-user-token",
+            token(SystemTime::now() + Duration::from_secs(60)),
+        );
+
+        // ...but the requesting user's own list doesn't.
+        let err = verify(
+            "cross-user-token",
+            "pgdog-example",
+            &["arn:aws:iam::123456789012:role/other-role".into()],
+            &cache,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err, StsAuthError::ArnNotAllowed);
+
+        // Empty list rejects too.
+        let err = verify("cross-user-token", "pgdog-example", &[], &cache)
+            .await
+            .unwrap_err();
+        assert_eq!(err, StsAuthError::ArnNotAllowed);
+    }
+
+    #[tokio::test]
+    async fn verify_propagates_precheck_errors_without_io() {
+        let cache = cache();
+        let err = verify("hunter2", "pgdog-example", &[ALLOWED_ROLE.into()], &cache)
+            .await
+            .unwrap_err();
+        assert_eq!(err, StsAuthError::InvalidUrl);
+        assert!(cache.inner.lock().is_empty());
     }
 }

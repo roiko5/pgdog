@@ -292,6 +292,15 @@ mirror_queue = 128
 # - md5
 # - trust
 auth_type = "scram"
+# Unique identifier for this PgDog deployment, used as the audience value
+# for AWS STS client authentication. Clients sign it into their presigned
+# STS token as the `x-pgdog-server-id` header, so a token minted for one
+# deployment can't be replayed against another.
+#
+# Required when any user sets `allowed_iam_arns` in users.toml.
+#
+# Default: not set (STS client authentication disabled)
+# sts_server_id = "pgdog-example"
 # Disable cross-shard queries.
 #
 # Default: false

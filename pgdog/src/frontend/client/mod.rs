@@ -14,7 +14,7 @@ use tracing::{Level as LogLevel, debug, enabled, error, info, trace, warn};
 
 use super::{ClientRequest, Error, PreparedStatements};
 use crate::auth::AuthResult;
-use crate::auth::{md5, scram::Server};
+use crate::auth::{md5, scram::Server, sts};
 use crate::backend::maintenance_mode;
 use crate::backend::pool::stats::MemoryStats;
 use crate::backend::{
@@ -239,6 +239,40 @@ impl Client {
         Ok(result)
     }
 
+    /// Authenticate a client that presents a presigned AWS STS
+    /// `GetCallerIdentity` URL as its password, mapping the verified
+    /// caller identity against the user's `allowed_iam_arns`.
+    async fn check_sts_token(
+        stream: &mut Stream,
+        user: &str,
+        server_id: &str,
+        allowed: &[String],
+    ) -> Result<AuthResult, Error> {
+        stream
+            .send_flush(&Authentication::ClearTextPassword)
+            .await?;
+        let response = Password::from_bytes(stream.read().await?.to_bytes())?;
+
+        let Some(token) = response.password() else {
+            return Ok(AuthResult::NoPasswordMessage);
+        };
+
+        let result =
+            match sts::verify(token, server_id, allowed, sts::StsTokenCache::global()).await {
+                Ok(validated) => {
+                    debug!(user, arn = validated.normalized_arn, "STS client auth ok");
+                    AuthResult::Ok
+                }
+                Err(err) => {
+                    // `err` never contains the token itself.
+                    warn!(r#"user "{}" STS token verification failed: {}"#, user, err);
+                    AuthResult::NoPasswordMatch
+                }
+            };
+
+        Ok(result)
+    }
+
     /// Create new frontend client from the given TCP stream.
     async fn login(
         mut stream: Stream,
@@ -257,6 +291,13 @@ impl Client {
         let admin = database == config.config.admin.name && config.config.admin.user == user;
         let admin_password = &config.config.admin.password;
         let auth_type = &config.config.general.auth_type;
+        // Empty string is treated as unset, mirroring config validation.
+        let sts_server_id = config
+            .config
+            .general
+            .sts_server_id
+            .as_deref()
+            .filter(|id| !id.is_empty());
         let passthrough = config.config.general.passthrough_auth();
         let id = FrontendPid::new();
         let key = BackendKeyData::new_frontend(protocol_version, id);
@@ -316,6 +357,18 @@ impl Client {
                         // Asked for a certificate and declined. Users that opt out
                         // fall through to password authentication instead.
                         AuthResult::NoClientCertificate
+                    } else if let Some(server_id) = sts_server_id
+                        && !cluster.allowed_iam_arns().is_empty()
+                    {
+                        // STS client auth: the password is a presigned
+                        // AWS STS GetCallerIdentity URL.
+                        Self::check_sts_token(
+                            &mut stream,
+                            user,
+                            server_id,
+                            cluster.allowed_iam_arns(),
+                        )
+                        .await?
                     } else {
                         // Resolve Vault static role
                         // entries to plaintext before the auth exchange
