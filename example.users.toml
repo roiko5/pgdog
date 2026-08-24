@@ -42,6 +42,10 @@ password = "pgdog"
 # Instead of a password, the client sends a presigned STS GetCallerIdentity URL
 # (SigV4 query-signed, valid for at most 900 seconds) with the `x-pgdog-server-id`
 # header — set to `sts_server_id` from pgdog.toml — included in its signed headers.
+# The URL must be signed for GET: STS is a Query-protocol service, so SDKs
+# presign GetCallerIdentity for POST by default, and PgDog replays the URL as a
+# GET — a POST-signed URL always fails with SignatureDoesNotMatch. In botocore,
+# pass HttpMethod="GET" to generate_presigned_url.
 # PgDog executes the URL against STS and lets the client in only if the verified
 # caller identity matches one of these IAM role ARNs (assumed-role ARNs are
 # normalized to the IAM role they were assumed from before matching).
