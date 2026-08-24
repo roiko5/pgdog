@@ -340,6 +340,10 @@ pub struct User {
     /// IAM role ARNs allowed to authenticate as this user via AWS STS client
     /// authentication. Clients present a presigned STS GetCallerIdentity URL as
     /// their password; the caller's role ARN must match one of these entries.
+    /// Entries must be the path-less role ARN exactly as it appears in
+    /// assumed-role ARNs (`arn:aws:iam::<account>:role/<Name>`); a
+    /// path-qualified entry (`role/some/path/<Name>`) can never match because
+    /// STS drops the path from assumed-role ARNs.
     ///
     /// **Note:** Requires `sts_server_id` to be set in the `[general]` section
     /// of `pgdog.toml`.

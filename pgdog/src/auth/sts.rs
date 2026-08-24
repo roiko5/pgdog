@@ -19,6 +19,7 @@ use reqwest::header::ACCEPT;
 use reqwest::redirect;
 use serde::Deserialize;
 use thiserror::Error;
+use tokio::sync::{Semaphore, SemaphorePermit};
 use tracing::warn;
 use url::Url;
 
@@ -49,6 +50,28 @@ const NEGATIVE_CACHE_TTL: Duration = Duration::from_secs(30);
 /// Upper bound on the STS response body size. Real `GetCallerIdentity`
 /// responses are well under 1KB; anything bigger isn't worth parsing.
 const MAX_RESPONSE_BYTES: usize = 64 * 1024;
+
+/// Maximum concurrent outbound STS verifications.
+///
+/// The negative cache only defuses repeated *identical* tokens; an
+/// unauthenticated client minting distinct well-formed presigned URLs
+/// (garbage signatures) would otherwise get one outbound round-trip per
+/// token, each holding a socket for up to [`STS_REQUEST_TIMEOUT`] —
+/// and STS throttles per account. Excess attempts are rejected
+/// immediately rather than queued: a queue would just move the
+/// resource exhaustion.
+const MAX_INFLIGHT_VERIFICATIONS: usize = 16;
+
+static INFLIGHT: Lazy<Semaphore> = Lazy::new(|| Semaphore::new(MAX_INFLIGHT_VERIFICATIONS));
+
+/// Reserve one of the [`MAX_INFLIGHT_VERIFICATIONS`] slots, failing
+/// immediately when all are taken. The permit is a RAII guard: it's
+/// released when dropped, on error and panic paths included.
+fn inflight_permit() -> Result<SemaphorePermit<'static>, StsAuthError> {
+    INFLIGHT
+        .try_acquire()
+        .map_err(|_| StsAuthError::TooManyVerifications)
+}
 
 /// Reasons a presigned STS URL fails validation before any I/O happens.
 #[derive(Debug, Clone, Error, PartialEq, Eq)]
@@ -126,6 +149,11 @@ pub enum StsAuthError {
     /// The verified caller identity is not in the user's `allowed_iam_arns`.
     #[error("caller identity is not in \"allowed_iam_arns\"")]
     ArnNotAllowed,
+
+    /// Too many STS verification requests are already in flight; the
+    /// attempt is rejected immediately instead of being queued.
+    #[error("too many concurrent STS verification requests")]
+    TooManyVerifications,
 }
 
 /// A presigned STS URL that passed offline validation and is ready to be
@@ -358,6 +386,11 @@ pub async fn verify(
 
     // Precheck failures are free (no I/O) and not negatively cached.
     let prechecked = precheck(password, server_id)?;
+
+    // Only now does the attempt cost an outbound request: take an
+    // in-flight slot for the round-trip (released on drop).
+    let _permit = inflight_permit()?;
+
     let client = http_client()?;
     let arn = execute(&client, &prechecked).await;
 
@@ -1324,6 +1357,61 @@ mod tests {
             .unwrap_err();
         assert_eq!(err, StsAuthError::InvalidUrl);
         assert!(cache.inner.lock().is_empty());
+    }
+
+    // ── in-flight verification cap ──────────────────────────────────────────
+
+    #[tokio::test]
+    async fn verify_rejects_when_verification_slots_exhausted() {
+        // Take every slot, as if that many verifications were in flight.
+        let permits: Vec<_> = (0..MAX_INFLIGHT_VERIFICATIONS)
+            .map(|_| INFLIGHT.try_acquire().unwrap())
+            .collect();
+
+        // Precheck-valid token: the rejection must come from the cap,
+        // after precheck and before any I/O could happen.
+        let url = url_with(
+            "sts.us-east-1.amazonaws.com",
+            &format_date(SystemTime::now()),
+            "900",
+            "host%3Bx-pgdog-server-id",
+        );
+        let err = verify(&url, "pgdog-example", &[ALLOWED_ROLE.into()], &cache())
+            .await
+            .unwrap_err();
+        assert_eq!(err, StsAuthError::TooManyVerifications);
+
+        // Releasing the permits frees every slot again.
+        drop(permits);
+        assert_eq!(INFLIGHT.available_permits(), MAX_INFLIGHT_VERIFICATIONS);
+    }
+
+    #[test]
+    fn inflight_permit_is_released_on_drop() {
+        let permit = inflight_permit().unwrap();
+        assert_eq!(INFLIGHT.available_permits(), MAX_INFLIGHT_VERIFICATIONS - 1);
+
+        // The permit is a RAII guard: dropping it (normal return, `?`, or
+        // unwinding) restores the slot.
+        drop(permit);
+        assert_eq!(INFLIGHT.available_permits(), MAX_INFLIGHT_VERIFICATIONS);
+    }
+
+    #[tokio::test]
+    async fn verify_cache_hits_bypass_the_inflight_cap() {
+        let permits: Vec<_> = (0..MAX_INFLIGHT_VERIFICATIONS)
+            .map(|_| INFLIGHT.try_acquire().unwrap())
+            .collect();
+
+        // Verified tokens keep working even while all verification
+        // slots are busy.
+        let cache = cache();
+        cache.insert("token", token(SystemTime::now() + Duration::from_secs(60)));
+        verify("token", "pgdog-example", &[ALLOWED_ROLE.into()], &cache)
+            .await
+            .unwrap();
+
+        drop(permits);
     }
 
     // ── negative cache ──────────────────────────────────────────────────────
