@@ -35,8 +35,23 @@ const CACHE_MAX_TTL: Duration = Duration::from_secs(300);
 /// Total timeout for the outbound `GetCallerIdentity` request to STS.
 const STS_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// How long a failed verification (STS rejection, transport failure,
+/// unparsable response, disallowed ARN) is remembered.
+///
+/// Precheck only validates syntax, so without this an attacker with no AWS
+/// credentials could mint well-formed presigned URLs (garbage signature) and
+/// turn every connection attempt into a fresh outbound STS call — and STS
+/// throttles per *account*, so sustained abuse could starve legitimate
+/// authentication. Kept short so a client retrying with fixed credentials
+/// recovers quickly.
+const NEGATIVE_CACHE_TTL: Duration = Duration::from_secs(30);
+
+/// Upper bound on the STS response body size. Real `GetCallerIdentity`
+/// responses are well under 1KB; anything bigger isn't worth parsing.
+const MAX_RESPONSE_BYTES: usize = 64 * 1024;
+
 /// Reasons a presigned STS URL fails validation before any I/O happens.
-#[derive(Debug, Error, PartialEq, Eq)]
+#[derive(Debug, Clone, Error, PartialEq, Eq)]
 pub enum StsAuthError {
     /// The password doesn't parse as a URL.
     #[error("password is not a valid URL")]
@@ -326,6 +341,8 @@ pub async fn verify(
     allowed: &[String],
     cache: &StsTokenCache,
 ) -> Result<ValidatedStsToken, StsAuthError> {
+    // Positive entries are checked first so a negative entry can never
+    // shadow an already-verified identity (hits re-authorize per user).
     if let Some(token) = cache.get(password) {
         return if matches_allowed(&token.normalized_arn, &token.arn, allowed) {
             Ok(token)
@@ -334,35 +351,72 @@ pub async fn verify(
         };
     }
 
+    // Recently-failed tokens don't get another STS round-trip.
+    if let Some(err) = cache.get_negative(password) {
+        return Err(err);
+    }
+
+    // Precheck failures are free (no I/O) and not negatively cached.
     let prechecked = precheck(password, server_id)?;
     let client = http_client()?;
-    let arn = execute(&client, &prechecked).await?;
-    let normalized_arn = normalize_arn(&arn);
+    let arn = execute(&client, &prechecked).await;
 
+    finish_verification(password, arn, prechecked.expires_at(), allowed, cache)
+}
+
+/// Turn the outcome of the STS round-trip into an authorization decision,
+/// updating the caches: failures (transport, rejection, bad response,
+/// disallowed ARN) are negatively cached; only a verified, authorized
+/// identity is positively cached.
+fn finish_verification(
+    password: &str,
+    arn: Result<String, StsAuthError>,
+    expires_at: SystemTime,
+    allowed: &[String],
+    cache: &StsTokenCache,
+) -> Result<ValidatedStsToken, StsAuthError> {
+    let arn = match arn {
+        Ok(arn) => arn,
+        Err(err) => {
+            cache.insert_negative(password, err.clone());
+            return Err(err);
+        }
+    };
+
+    let normalized_arn = normalize_arn(&arn);
     if !matches_allowed(&normalized_arn, &arn, allowed) {
+        cache.insert_negative(password, StsAuthError::ArnNotAllowed);
         return Err(StsAuthError::ArnNotAllowed);
     }
 
     let token = ValidatedStsToken {
         arn,
         normalized_arn,
-        expires_at: prechecked.expires_at(),
+        expires_at,
     };
     cache.insert(password, token.clone());
 
     Ok(token)
 }
 
-/// Build the HTTP client used for STS verification requests.
+/// The HTTP client used for STS verification requests.
 ///
 /// Redirects are disabled so the request can only ever reach the
-/// prechecked URL.
+/// prechecked URL. Built once and reused: the client holds a connection
+/// pool, so per-verification construction would waste a TLS handshake
+/// on every cache miss.
 fn http_client() -> Result<reqwest::Client, StsAuthError> {
-    reqwest::Client::builder()
-        .timeout(STS_REQUEST_TIMEOUT)
-        .redirect(redirect::Policy::none())
-        .build()
-        .map_err(|err| StsAuthError::RequestFailed(err.without_url().to_string()))
+    static CLIENT: Lazy<Result<reqwest::Client, reqwest::Error>> = Lazy::new(|| {
+        reqwest::Client::builder()
+            .timeout(STS_REQUEST_TIMEOUT)
+            .redirect(redirect::Policy::none())
+            .build()
+    });
+
+    CLIENT
+        .as_ref()
+        .map(Clone::clone)
+        .map_err(|err| StsAuthError::RequestFailed(err.to_string()))
 }
 
 /// Execute the `GetCallerIdentity` request for a prechecked token and
@@ -390,7 +444,7 @@ async fn execute_url(
     // stripped with `without_url()` before the error is surfaced.
     let token_sha256 = token_fingerprint(url.as_str());
 
-    let response = client
+    let mut response = client
         .get(url)
         .header(SERVER_ID_HEADER, server_id)
         .header(ACCEPT, "application/json")
@@ -408,10 +462,23 @@ async fn execute_url(
         return Err(StsAuthError::StsRejected(status.as_u16()));
     }
 
-    let body = response
-        .text()
-        .await
-        .map_err(|err| StsAuthError::RequestFailed(err.without_url().to_string()))?;
+    // Read the body with a hard size cap instead of `text()`.
+    let mut body = Vec::new();
+    loop {
+        let chunk = response
+            .chunk()
+            .await
+            .map_err(|err| StsAuthError::RequestFailed(err.without_url().to_string()))?;
+        let Some(chunk) = chunk else { break };
+        if body.len() + chunk.len() > MAX_RESPONSE_BYTES {
+            return Err(StsAuthError::InvalidResponse(
+                "response body too large".into(),
+            ));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    let body = String::from_utf8(body)
+        .map_err(|_| StsAuthError::InvalidResponse("response body is not UTF-8".into()))?;
 
     parse_caller_identity(&body)
 }
@@ -454,20 +521,30 @@ struct CachedValidation {
     cache_expires_at: SystemTime,
 }
 
+struct CachedRejection {
+    error: StsAuthError,
+    cache_expires_at: SystemTime,
+}
+
 /// Cache of verified STS tokens, keyed by SHA-256 of the full password
 /// string, so repeated connections with the same presigned URL skip the
 /// round-trip to STS.
 ///
 /// Entries live until the presigned URL expires, capped at [`CACHE_MAX_TTL`]
-/// after insertion. Expired entries are pruned on access.
+/// after insertion. Failed verifications are remembered separately for
+/// [`NEGATIVE_CACHE_TTL`]. Expired entries in both maps are pruned on
+/// access (per key on reads, full sweep on inserts), so neither map grows
+/// beyond the distinct tokens seen in one TTL window.
 pub struct StsTokenCache {
     inner: Mutex<HashMap<[u8; 32], CachedValidation>>,
+    negative: Mutex<HashMap<[u8; 32], CachedRejection>>,
 }
 
 impl StsTokenCache {
     fn new() -> Self {
         Self {
             inner: Mutex::new(HashMap::new()),
+            negative: Mutex::new(HashMap::new()),
         }
     }
 
@@ -513,6 +590,45 @@ impl StsTokenCache {
             CachedValidation {
                 token,
                 cache_expires_at,
+            },
+        );
+    }
+
+    /// Return the remembered rejection for this token, if it hasn't expired.
+    pub fn get_negative(&self, password: &str) -> Option<StsAuthError> {
+        self.get_negative_at(password, SystemTime::now())
+    }
+
+    fn get_negative_at(&self, password: &str, now: SystemTime) -> Option<StsAuthError> {
+        let key = cache_key(password);
+        let mut negative = self.negative.lock();
+
+        match negative.get(&key) {
+            Some(cached) if cached.cache_expires_at > now => Some(cached.error.clone()),
+            Some(_) => {
+                // Prune on access.
+                negative.remove(&key);
+                None
+            }
+            None => None,
+        }
+    }
+
+    /// Remember a failed verification for [`NEGATIVE_CACHE_TTL`].
+    pub fn insert_negative(&self, password: &str, error: StsAuthError) {
+        self.insert_negative_at(password, error, SystemTime::now())
+    }
+
+    fn insert_negative_at(&self, password: &str, error: StsAuthError, now: SystemTime) {
+        let mut negative = self.negative.lock();
+
+        // Prune expired entries so abandoned tokens don't accumulate.
+        negative.retain(|_, cached| cached.cache_expires_at > now);
+        negative.insert(
+            cache_key(password),
+            CachedRejection {
+                error,
+                cache_expires_at: now + NEGATIVE_CACHE_TTL,
             },
         );
     }
@@ -1208,5 +1324,157 @@ mod tests {
             .unwrap_err();
         assert_eq!(err, StsAuthError::InvalidUrl);
         assert!(cache.inner.lock().is_empty());
+    }
+
+    // ── negative cache ──────────────────────────────────────────────────────
+
+    #[test]
+    fn negative_cache_returns_error_within_ttl_and_expires_after() {
+        let cache = cache();
+        let t0 = now();
+        cache.insert_negative_at("bad-token", StsAuthError::StsRejected(403), t0);
+
+        assert_eq!(
+            cache.get_negative_at("bad-token", t0 + Duration::from_secs(29)),
+            Some(StsAuthError::StsRejected(403))
+        );
+        // Expired at the TTL boundary: the client may retry against STS.
+        assert_eq!(
+            cache.get_negative_at("bad-token", t0 + Duration::from_secs(30)),
+            None
+        );
+    }
+
+    #[test]
+    fn negative_cache_prunes_expired_entries_on_insert() {
+        let cache = cache();
+        let t0 = now();
+        cache.insert_negative_at("stale-token", StsAuthError::StsRejected(403), t0);
+
+        // Well past "stale-token"'s expiry: it gets pruned on insert.
+        let t1 = t0 + Duration::from_secs(60);
+        cache.insert_negative_at("fresh-token", StsAuthError::ArnNotAllowed, t1);
+
+        assert_eq!(cache.negative.lock().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn verify_short_circuits_on_negative_cache_before_precheck() {
+        let cache = cache();
+        // Not even a URL: a negative hit must return before precheck runs
+        // (and therefore before any I/O could happen).
+        cache.insert_negative("bad-token", StsAuthError::StsRejected(403));
+
+        let err = verify("bad-token", "pgdog-example", &[ALLOWED_ROLE.into()], &cache)
+            .await
+            .unwrap_err();
+        assert_eq!(err, StsAuthError::StsRejected(403));
+    }
+
+    #[tokio::test]
+    async fn verify_positive_cache_wins_over_negative_entry() {
+        let cache = cache();
+        cache.insert("token", token(SystemTime::now() + Duration::from_secs(60)));
+        cache.insert_negative("token", StsAuthError::StsRejected(403));
+
+        // A verified token stays usable: positive entries are checked first,
+        // so a negative entry can never shadow a verified identity.
+        verify("token", "pgdog-example", &[ALLOWED_ROLE.into()], &cache)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn verify_precheck_failure_does_not_consume_negative_cache_slot() {
+        let cache = cache();
+        // Precheck failures are free (no I/O), so they must not take up
+        // negative-cache memory.
+        let err = verify("hunter2", "pgdog-example", &[ALLOWED_ROLE.into()], &cache)
+            .await
+            .unwrap_err();
+        assert_eq!(err, StsAuthError::InvalidUrl);
+        assert!(cache.negative.lock().is_empty());
+    }
+
+    #[test]
+    fn finish_verification_failure_inserts_negative_entry() {
+        let cache = cache();
+        let expires_at = SystemTime::now() + Duration::from_secs(60);
+
+        let err = finish_verification(
+            "rejected-token",
+            Err(StsAuthError::StsRejected(403)),
+            expires_at,
+            &[ALLOWED_ROLE.into()],
+            &cache,
+        )
+        .unwrap_err();
+
+        assert_eq!(err, StsAuthError::StsRejected(403));
+        assert_eq!(
+            cache.get_negative("rejected-token"),
+            Some(StsAuthError::StsRejected(403))
+        );
+        assert!(cache.get("rejected-token").is_none());
+    }
+
+    #[test]
+    fn finish_verification_disallowed_arn_inserts_negative_entry() {
+        let cache = cache();
+        let expires_at = SystemTime::now() + Duration::from_secs(60);
+        let arn = "arn:aws:sts::123456789012:assumed-role/other-role/session".to_string();
+
+        let err = finish_verification(
+            "wrong-role-token",
+            Ok(arn),
+            expires_at,
+            &[ALLOWED_ROLE.into()],
+            &cache,
+        )
+        .unwrap_err();
+
+        assert_eq!(err, StsAuthError::ArnNotAllowed);
+        assert_eq!(
+            cache.get_negative("wrong-role-token"),
+            Some(StsAuthError::ArnNotAllowed)
+        );
+        assert!(cache.get("wrong-role-token").is_none());
+    }
+
+    #[test]
+    fn finish_verification_success_inserts_positive_entry_only() {
+        let cache = cache();
+        let expires_at = SystemTime::now() + Duration::from_secs(60);
+        let arn = "arn:aws:sts::123456789012:assumed-role/some-role/session".to_string();
+
+        let validated = finish_verification(
+            "good-token",
+            Ok(arn),
+            expires_at,
+            &[ALLOWED_ROLE.into()],
+            &cache,
+        )
+        .unwrap();
+
+        assert_eq!(validated.normalized_arn, ALLOWED_ROLE);
+        assert!(cache.get("good-token").is_some());
+        assert_eq!(cache.get_negative("good-token"), None);
+    }
+
+    #[tokio::test]
+    async fn execute_url_rejects_oversized_body() {
+        let server = MockServer::start().await;
+
+        Mock::given(http_method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string("x".repeat(MAX_RESPONSE_BYTES + 1)),
+            )
+            .mount(&server)
+            .await;
+
+        assert!(matches!(
+            execute_against(&server).await.unwrap_err(),
+            StsAuthError::InvalidResponse(_)
+        ));
     }
 }
