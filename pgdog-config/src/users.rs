@@ -653,8 +653,8 @@ mod tests {
         // No password, no mTLS identity, no allowed IAM ARNs: clients have
         // no way in, so the startup warning is deserved.
         let mut user = User {
-            name: "issues_service".into(),
-            database: "pool".into(),
+            name: "app_service".into(),
+            database: "app_db".into(),
             ..Default::default()
         };
         assert!(!user.has_client_auth(&config));

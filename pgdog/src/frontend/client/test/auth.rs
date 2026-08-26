@@ -120,6 +120,35 @@ async fn test_sts_auth_failure_increments_reason_counter() {
     assert!(failure_count("sts_token_rejected") > before);
 }
 
+/// With every STS verification slot busy for the whole bounded wait, a
+/// precheck-valid token is rejected with a retryable capacity error
+/// (53300), not the uniform credential error, and counts under its own
+/// failure reason. Takes ~5s: the bounded wait really elapses.
+#[tokio::test]
+async fn test_sts_auth_overload_returns_capacity_error() {
+    use crate::stats::client_auth::failure_count;
+
+    let permits = crate::auth::sts::hold_all_inflight_permits();
+    let before = failure_count("sts_verification_overloaded");
+
+    // Precheck-valid URL dated now: the rejection must come from the cap.
+    let date = chrono::Utc::now().format("%Y%m%dT%H%M%SZ");
+    let token = format!(
+        "https://sts.us-east-1.amazonaws.com/?Action=GetCallerIdentity\
+         &X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Date={date}\
+         &X-Amz-Expires=900&X-Amz-SignedHeaders=host%3Bx-pgdog-server-id\
+         &X-Amz-Signature=deadbeef"
+    );
+
+    let mut client = login_sts(&token).await;
+    let error = ErrorResponse::try_from(client.read().await).unwrap();
+    assert_eq!(error.code, "53300");
+    client.join().await;
+    drop(permits);
+
+    assert!(failure_count("sts_verification_overloaded") > before);
+}
+
 /// A token already verified against STS (seeded into the process-wide
 /// cache) authenticates the client. This exercises the full handshake
 /// wiring without a live STS endpoint.

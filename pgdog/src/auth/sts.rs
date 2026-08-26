@@ -53,24 +53,38 @@ const MAX_RESPONSE_BYTES: usize = 64 * 1024;
 
 /// Maximum concurrent outbound STS verifications.
 ///
-/// The negative cache only defuses repeated *identical* tokens; an
-/// unauthenticated client minting distinct well-formed presigned URLs
-/// (garbage signatures) would otherwise get one outbound round-trip per
-/// token, each holding a socket for up to [`STS_REQUEST_TIMEOUT`] —
-/// and STS throttles per account. Excess attempts are rejected
-/// immediately rather than queued: a queue would just move the
-/// resource exhaustion.
-const MAX_INFLIGHT_VERIFICATIONS: usize = 16;
+/// The negative cache only defuses repeated *identical* tokens; distinct
+/// well-formed URLs each cost an outbound round-trip, and STS throttles
+/// per account. Sized above a client pool's cold-start burst: every
+/// connection in the pool can arrive at once, each with a fresh token.
+const MAX_INFLIGHT_VERIFICATIONS: usize = 64;
+
+/// How long a verification waits for a slot before giving up: one full
+/// slot-holder lifetime. If nothing frees up in that long, the pooler is
+/// saturated and shedding load is correct.
+const INFLIGHT_WAIT_TIMEOUT: Duration = STS_REQUEST_TIMEOUT;
 
 static INFLIGHT: Lazy<Semaphore> = Lazy::new(|| Semaphore::new(MAX_INFLIGHT_VERIFICATIONS));
 
-/// Reserve one of the [`MAX_INFLIGHT_VERIFICATIONS`] slots, failing
-/// immediately when all are taken. The permit is a RAII guard: it's
-/// released when dropped, on error and panic paths included.
-fn inflight_permit() -> Result<SemaphorePermit<'static>, StsAuthError> {
-    INFLIGHT
-        .try_acquire()
+/// Reserve a verification slot, waiting up to [`INFLIGHT_WAIT_TIMEOUT`]
+/// (FIFO) for one to free: connect bursts get absorbed, sustained
+/// overload is shed. The permit is released on drop, error and panic
+/// paths included.
+async fn inflight_permit() -> Result<SemaphorePermit<'static>, StsAuthError> {
+    tokio::time::timeout(INFLIGHT_WAIT_TIMEOUT, INFLIGHT.acquire())
+        .await
+        .map_err(|_| StsAuthError::TooManyVerifications)?
+        // The semaphore is never closed; acquire can only fail if it were.
         .map_err(|_| StsAuthError::TooManyVerifications)
+}
+
+/// Hold every verification slot, as if that many verifications were in
+/// flight.
+#[cfg(test)]
+pub(crate) fn hold_all_inflight_permits() -> Vec<SemaphorePermit<'static>> {
+    (0..MAX_INFLIGHT_VERIFICATIONS)
+        .map(|_| INFLIGHT.try_acquire().unwrap())
+        .collect()
 }
 
 /// Reasons a presigned STS URL fails validation before any I/O happens.
@@ -150,9 +164,9 @@ pub enum StsAuthError {
     #[error("caller identity is not in \"allowed_iam_arns\"")]
     ArnNotAllowed,
 
-    /// Too many STS verification requests are already in flight; the
-    /// attempt is rejected immediately instead of being queued.
-    #[error("too many concurrent STS verification requests")]
+    /// No verification slot freed up within [`INFLIGHT_WAIT_TIMEOUT`]:
+    /// a load condition, not a judgment of the credential.
+    #[error("timed out waiting for an STS verification slot")]
     TooManyVerifications,
 }
 
@@ -394,7 +408,7 @@ pub async fn verify(
 
     // Only now does the attempt cost an outbound request: take an
     // in-flight slot for the round-trip (released on drop).
-    let _permit = inflight_permit()?;
+    let _permit = inflight_permit().await?;
 
     let client = http_client()?;
     let arn = execute(&client, &prechecked).await;
@@ -1443,12 +1457,9 @@ mod tests {
 
     // ── in-flight verification cap ──────────────────────────────────────────
 
-    #[tokio::test]
-    async fn verify_rejects_when_verification_slots_exhausted() {
-        // Take every slot, as if that many verifications were in flight.
-        let permits: Vec<_> = (0..MAX_INFLIGHT_VERIFICATIONS)
-            .map(|_| INFLIGHT.try_acquire().unwrap())
-            .collect();
+    #[tokio::test(start_paused = true)]
+    async fn verify_rejects_when_verification_slots_stay_exhausted() {
+        let permits = hold_all_inflight_permits();
 
         // Precheck-valid token: the rejection must come from the cap,
         // after precheck and before any I/O could happen.
@@ -1458,19 +1469,37 @@ mod tests {
             "900",
             "host%3Bx-pgdog-server-id",
         );
-        let err = verify(&url, "pgdog-example", &[ALLOWED_ROLE.into()], &cache())
+        let cache = cache();
+        let err = verify(&url, "pgdog-example", &[ALLOWED_ROLE.into()], &cache)
             .await
             .unwrap_err();
         assert_eq!(err, StsAuthError::TooManyVerifications);
+
+        assert!(cache.negative.lock().is_empty());
 
         // Releasing the permits frees every slot again.
         drop(permits);
         assert_eq!(INFLIGHT.available_permits(), MAX_INFLIGHT_VERIFICATIONS);
     }
 
-    #[test]
-    fn inflight_permit_is_released_on_drop() {
-        let permit = inflight_permit().unwrap();
+    #[tokio::test(start_paused = true)]
+    async fn inflight_permit_waits_for_a_freed_slot() {
+        let mut permits = hold_all_inflight_permits();
+
+        let waiter = tokio::spawn(async { inflight_permit().await.map(drop) });
+        // Let the waiter join the semaphore queue before a slot frees.
+        tokio::task::yield_now().await;
+
+        drop(permits.pop());
+        waiter.await.unwrap().unwrap();
+
+        drop(permits);
+        assert_eq!(INFLIGHT.available_permits(), MAX_INFLIGHT_VERIFICATIONS);
+    }
+
+    #[tokio::test]
+    async fn inflight_permit_is_released_on_drop() {
+        let permit = inflight_permit().await.unwrap();
         assert_eq!(INFLIGHT.available_permits(), MAX_INFLIGHT_VERIFICATIONS - 1);
 
         // The permit is a RAII guard: dropping it (normal return, `?`, or
@@ -1479,11 +1508,15 @@ mod tests {
         assert_eq!(INFLIGHT.available_permits(), MAX_INFLIGHT_VERIFICATIONS);
     }
 
+    #[test]
+    fn cap_covers_a_full_client_pool_burst() {
+        // Common client-side pool sizes reach 50 connections.
+        assert!(MAX_INFLIGHT_VERIFICATIONS >= 50);
+    }
+
     #[tokio::test]
     async fn verify_cache_hits_bypass_the_inflight_cap() {
-        let permits: Vec<_> = (0..MAX_INFLIGHT_VERIFICATIONS)
-            .map(|_| INFLIGHT.try_acquire().unwrap())
-            .collect();
+        let permits = hold_all_inflight_permits();
 
         // Verified tokens keep working even while all verification
         // slots are busy.

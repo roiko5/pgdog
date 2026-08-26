@@ -56,6 +56,25 @@ impl ErrorResponse {
         }
     }
 
+    /// Verification capacity was exhausted before the credential could
+    /// be judged. Distinguishable from [`ErrorResponse::auth`] on
+    /// purpose: retrying is the right response, and 53300
+    /// (too_many_connections) is a state drivers already retry on.
+    pub(crate) fn auth_overloaded(user: &str, database: &str) -> ErrorResponse {
+        ErrorResponse {
+            severity: "FATAL".into(),
+            code: "53300".into(),
+            message: format!(
+                "too many concurrent authentication requests for user \"{}\" and database \"{}\", retry",
+                user, database
+            ),
+            detail: None,
+            context: None,
+            file: None,
+            routine: None,
+        }
+    }
+
     pub(crate) fn cross_shard_disabled(query: Option<&str>) -> ErrorResponse {
         ErrorResponse {
             severity: "ERROR".into(),
