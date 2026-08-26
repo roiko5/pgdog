@@ -312,6 +312,10 @@ impl Client {
         //
         // This is likely because passthrough authentication is enabled.
         //
+        // STS client auth reuses the regular password exchange (the presigned
+        // URL arrives in the password field), so the connect log needs its own
+        // record of the method — `auth_type` alone can't distinguish it.
+        let mut sts_auth = false;
         let auth_result = if admin {
             // The admin database is virtual and never present in the cluster
             // map, so authenticate directly against the configured admin password.
@@ -362,6 +366,7 @@ impl Client {
                     {
                         // STS client auth: the password is a presigned
                         // AWS STS GetCallerIdentity URL.
+                        sts_auth = true;
                         Self::check_sts_token(
                             &mut stream,
                             user,
@@ -449,11 +454,7 @@ impl Client {
                 user,
                 database,
                 addr,
-                if passthrough {
-                    "passthrough".into()
-                } else {
-                    auth_type.to_string()
-                },
+                auth_method_label(passthrough, sts_auth, auth_type),
                 if stream.is_tls() { "🔒" } else { "" }
             );
         }
@@ -774,6 +775,19 @@ impl Drop for Client {
     }
 }
 
+/// Label for the connect log naming the authentication method that actually
+/// ran. STS is wire-compatible with regular password auth, so the configured
+/// `auth_type` would mislabel STS connections as e.g. `scram`.
+fn auth_method_label(passthrough: bool, sts: bool, auth_type: &AuthType) -> String {
+    if passthrough {
+        "passthrough".into()
+    } else if sts {
+        "sts".into()
+    } else {
+        auth_type.to_string()
+    }
+}
+
 #[cfg(test)]
 impl Client {
     pub async fn spawn_test(mut self) {
@@ -799,6 +813,26 @@ impl MemoryUsage for Client {
 
 #[cfg(test)]
 pub mod test;
+
+#[cfg(test)]
+mod auth_method_label_tests {
+    use super::{AuthType, auth_method_label};
+
+    #[test]
+    fn sts_connections_are_labeled_sts_not_the_wire_auth_type() {
+        // The STS handshake is SCRAM/plain-shaped on the wire, but the log
+        // must say which method actually authenticated the client.
+        assert_eq!(auth_method_label(false, true, &AuthType::Scram), "sts");
+        assert_eq!(auth_method_label(false, true, &AuthType::Plain), "sts");
+
+        // Non-STS connections keep their existing labels.
+        assert_eq!(auth_method_label(false, false, &AuthType::Scram), "scram");
+        assert_eq!(
+            auth_method_label(true, false, &AuthType::Scram),
+            "passthrough"
+        );
+    }
+}
 
 #[cfg(test)]
 mod client_certificate_tests {
