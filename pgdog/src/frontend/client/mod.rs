@@ -273,7 +273,7 @@ impl Client {
                 Err(err) => {
                     // `err` never contains the token itself.
                     warn!(r#"user "{}" STS token verification failed: {}"#, user, err);
-                    AuthResult::NoPasswordMatch
+                    AuthResult::NoStsToken
                 }
             };
 
@@ -395,6 +395,9 @@ impl Client {
         };
 
         if !auth_result.is_ok() {
+            // The reason is only for logs and metrics; the client gets the
+            // same uniform auth error no matter which check failed.
+            crate::stats::client_auth::record_failure(auth_result.reason());
             if log_connections {
                 warn!(
                     r#"user "{}" and database "{}" auth error: {}"#,

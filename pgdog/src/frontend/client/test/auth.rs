@@ -103,6 +103,23 @@ async fn test_sts_auth_rejects_invalid_token() {
     client.join().await;
 }
 
+/// A rejected STS login increments the client auth failure counter under
+/// its own reason, while the client still receives the uniform 28000.
+#[tokio::test]
+async fn test_sts_auth_failure_increments_reason_counter() {
+    use crate::stats::client_auth::failure_count;
+
+    let before = failure_count("sts_token_rejected");
+
+    let mut client = login_sts("counted-but-not-a-presigned-sts-url").await;
+    let error = ErrorResponse::try_from(client.read().await).unwrap();
+    assert_eq!(error.code, "28000");
+    client.join().await;
+
+    // ">" not "==": other STS tests in this process record failures too.
+    assert!(failure_count("sts_token_rejected") > before);
+}
+
 /// A token already verified against STS (seeded into the process-wide
 /// cache) authenticates the client. This exercises the full handshake
 /// wiring without a live STS endpoint.

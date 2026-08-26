@@ -1,4 +1,5 @@
 //! Statistics.
+pub(crate) mod client_auth;
 pub(crate) mod clients;
 pub(crate) mod clients_locked;
 pub(crate) mod http_server;
@@ -15,6 +16,7 @@ pub(crate) mod memory;
 pub(crate) mod query_cache;
 pub(crate) mod two_pc;
 
+pub(crate) use client_auth::ClientAuth;
 pub(crate) use clients::Clients;
 pub(crate) use clients_locked::ClientsLocked;
 pub(crate) use listeners::Listeners;
