@@ -193,6 +193,10 @@ pub struct ValidatedStsToken {
     pub normalized_arn: String,
     /// When the presigned URL expires (`X-Amz-Date` + `X-Amz-Expires`).
     pub expires_at: SystemTime,
+    /// Audience (`sts_server_id`) the token was verified against. Cache
+    /// hits are only valid for this audience: after `sts_server_id` is
+    /// rotated, a token verified under the old value must re-verify.
+    pub server_id: String,
 }
 
 /// Validate a presigned STS `GetCallerIdentity` URL without performing any
@@ -362,7 +366,8 @@ pub fn matches_allowed(normalized: &str, raw: &str, allowed: &[String]) -> bool 
 ///
 /// Verified tokens are cached (keyed by the token alone), so a hit may have
 /// been inserted on behalf of a different user: cache hits skip the STS
-/// round-trip but are re-authorized against `allowed` every time.
+/// round-trip but are re-authorized against `allowed` every time, and are
+/// only served for the audience (`server_id`) they were verified under.
 pub async fn verify(
     password: &str,
     server_id: &str,
@@ -371,7 +376,7 @@ pub async fn verify(
 ) -> Result<ValidatedStsToken, StsAuthError> {
     // Positive entries are checked first so a negative entry can never
     // shadow an already-verified identity (hits re-authorize per user).
-    if let Some(token) = cache.get(password) {
+    if let Some(token) = cache.get(password, server_id) {
         return if matches_allowed(&token.normalized_arn, &token.arn, allowed) {
             Ok(token)
         } else {
@@ -394,7 +399,14 @@ pub async fn verify(
     let client = http_client()?;
     let arn = execute(&client, &prechecked).await;
 
-    finish_verification(password, arn, prechecked.expires_at(), allowed, cache)
+    finish_verification(
+        password,
+        arn,
+        prechecked.expires_at(),
+        server_id,
+        allowed,
+        cache,
+    )
 }
 
 /// Turn the outcome of the STS round-trip into an authorization decision,
@@ -405,6 +417,7 @@ fn finish_verification(
     password: &str,
     arn: Result<String, StsAuthError>,
     expires_at: SystemTime,
+    server_id: &str,
     allowed: &[String],
     cache: &StsTokenCache,
 ) -> Result<ValidatedStsToken, StsAuthError> {
@@ -426,6 +439,7 @@ fn finish_verification(
         arn,
         normalized_arn,
         expires_at,
+        server_id: server_id.to_owned(),
     };
     cache.insert(password, token.clone());
 
@@ -587,19 +601,32 @@ impl StsTokenCache {
         &INSTANCE
     }
 
-    /// Return the cached validation for this password, if it hasn't expired.
-    pub fn get(&self, password: &str) -> Option<ValidatedStsToken> {
-        self.get_at(password, SystemTime::now())
+    /// Return the cached validation for this password, if it hasn't expired
+    /// and was verified against the same audience (`sts_server_id`).
+    pub fn get(&self, password: &str, server_id: &str) -> Option<ValidatedStsToken> {
+        self.get_at(password, server_id, SystemTime::now())
     }
 
-    fn get_at(&self, password: &str, now: SystemTime) -> Option<ValidatedStsToken> {
+    fn get_at(
+        &self,
+        password: &str,
+        server_id: &str,
+        now: SystemTime,
+    ) -> Option<ValidatedStsToken> {
         let key = cache_key(password);
         let mut inner = self.inner.lock();
 
         match inner.get(&key) {
-            Some(cached) if cached.cache_expires_at > now => Some(cached.token.clone()),
+            Some(cached)
+                if cached.cache_expires_at > now && cached.token.server_id == server_id =>
+            {
+                Some(cached.token.clone())
+            }
             Some(_) => {
-                // Prune on access.
+                // Prune on access: the entry expired, or `sts_server_id` was
+                // rotated since it was verified. A rotated-away entry can
+                // never become valid again (the audience header is part of
+                // the signature), so drop it and re-verify against STS.
                 inner.remove(&key);
                 None
             }
@@ -1048,6 +1075,7 @@ mod tests {
             arn: "arn:aws:sts::123456789012:assumed-role/some-role/session".into(),
             normalized_arn: "arn:aws:iam::123456789012:role/some-role".into(),
             expires_at,
+            server_id: "pgdog-example".into(),
         }
     }
 
@@ -1062,7 +1090,7 @@ mod tests {
         cache.insert_at("password-1", token(t0 + Duration::from_secs(900)), t0);
 
         let cached = cache
-            .get_at("password-1", t0 + Duration::from_secs(299))
+            .get_at("password-1", "pgdog-example", t0 + Duration::from_secs(299))
             .unwrap();
         assert_eq!(
             cached.normalized_arn,
@@ -1073,7 +1101,11 @@ mod tests {
     #[test]
     fn cache_misses_for_unknown_password() {
         let cache = cache();
-        assert!(cache.get_at("never-inserted", now()).is_none());
+        assert!(
+            cache
+                .get_at("never-inserted", "pgdog-example", now())
+                .is_none()
+        );
     }
 
     #[test]
@@ -1085,7 +1117,7 @@ mod tests {
 
         assert!(
             cache
-                .get_at("password-2", t0 + Duration::from_secs(300))
+                .get_at("password-2", "pgdog-example", t0 + Duration::from_secs(300))
                 .is_none()
         );
     }
@@ -1098,12 +1130,12 @@ mod tests {
 
         assert!(
             cache
-                .get_at("password-3", t0 + Duration::from_secs(59))
+                .get_at("password-3", "pgdog-example", t0 + Duration::from_secs(59))
                 .is_some()
         );
         assert!(
             cache
-                .get_at("password-3", t0 + Duration::from_secs(60))
+                .get_at("password-3", "pgdog-example", t0 + Duration::from_secs(60))
                 .is_none()
         );
     }
@@ -1119,7 +1151,7 @@ mod tests {
         cache.insert_at("fresh", token(t1 + Duration::from_secs(60)), t1);
 
         assert_eq!(cache.inner.lock().len(), 1);
-        assert!(cache.get_at("fresh", t1).is_some());
+        assert!(cache.get_at("fresh", "pgdog-example", t1).is_some());
     }
 
     #[test]
@@ -1127,7 +1159,22 @@ mod tests {
         let cache = cache();
         let t0 = now();
         cache.insert_at("password-a", token(t0 + Duration::from_secs(60)), t0);
-        assert!(cache.get_at("password-b", t0).is_none());
+        assert!(cache.get_at("password-b", "pgdog-example", t0).is_none());
+    }
+
+    #[test]
+    fn cache_misses_and_prunes_after_audience_rotation() {
+        let cache = cache();
+        let t0 = now();
+        // Verified while `sts_server_id` was "pgdog-example"...
+        cache.insert_at("password-r", token(t0 + Duration::from_secs(900)), t0);
+        assert!(cache.get_at("password-r", "pgdog-example", t0).is_some());
+
+        // ...then the audience is rotated: the entry is dead immediately,
+        // not after min(token life, CACHE_MAX_TTL).
+        assert!(cache.get_at("password-r", "rotated-audience", t0).is_none());
+        // And pruned, so it can't come back if the audience rotates again.
+        assert!(cache.inner.lock().is_empty());
     }
 
     #[test]
@@ -1350,6 +1397,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn verify_cache_hit_requires_matching_audience() {
+        let cache = cache();
+        // Verified under the audience baked into `token()` ("pgdog-example").
+        // "rotated-token" isn't a URL, so if the rotated verify below gets
+        // past the cache it must fail in precheck — proof the cached verdict
+        // wasn't reused.
+        cache.insert(
+            "rotated-token",
+            token(SystemTime::now() + Duration::from_secs(60)),
+        );
+
+        // Same audience: served from cache.
+        verify(
+            "rotated-token",
+            "pgdog-example",
+            &[ALLOWED_ROLE.into()],
+            &cache,
+        )
+        .await
+        .unwrap();
+
+        // `sts_server_id` rotated: the cached verdict no longer applies and
+        // the token goes through full verification again.
+        let err = verify(
+            "rotated-token",
+            "rotated-audience",
+            &[ALLOWED_ROLE.into()],
+            &cache,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err, StsAuthError::InvalidUrl);
+    }
+
+    #[tokio::test]
     async fn verify_propagates_precheck_errors_without_io() {
         let cache = cache();
         let err = verify("hunter2", "pgdog-example", &[ALLOWED_ROLE.into()], &cache)
@@ -1493,6 +1575,7 @@ mod tests {
             "rejected-token",
             Err(StsAuthError::StsRejected(403)),
             expires_at,
+            "pgdog-example",
             &[ALLOWED_ROLE.into()],
             &cache,
         )
@@ -1503,7 +1586,7 @@ mod tests {
             cache.get_negative("rejected-token"),
             Some(StsAuthError::StsRejected(403))
         );
-        assert!(cache.get("rejected-token").is_none());
+        assert!(cache.get("rejected-token", "pgdog-example").is_none());
     }
 
     #[test]
@@ -1516,6 +1599,7 @@ mod tests {
             "wrong-role-token",
             Ok(arn),
             expires_at,
+            "pgdog-example",
             &[ALLOWED_ROLE.into()],
             &cache,
         )
@@ -1526,7 +1610,7 @@ mod tests {
             cache.get_negative("wrong-role-token"),
             Some(StsAuthError::ArnNotAllowed)
         );
-        assert!(cache.get("wrong-role-token").is_none());
+        assert!(cache.get("wrong-role-token", "pgdog-example").is_none());
     }
 
     #[test]
@@ -1539,13 +1623,14 @@ mod tests {
             "good-token",
             Ok(arn),
             expires_at,
+            "pgdog-example",
             &[ALLOWED_ROLE.into()],
             &cache,
         )
         .unwrap();
 
         assert_eq!(validated.normalized_arn, ALLOWED_ROLE);
-        assert!(cache.get("good-token").is_some());
+        assert!(cache.get("good-token", "pgdog-example").is_some());
         assert_eq!(cache.get_negative("good-token"), None);
     }
 

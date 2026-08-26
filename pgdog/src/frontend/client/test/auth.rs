@@ -118,6 +118,7 @@ async fn test_sts_auth_accepts_verified_token() {
             ),
             normalized_arn: STS_ALLOWED_ROLE.into(),
             expires_at: SystemTime::now() + Duration::from_secs(300),
+            server_id: "pgdog-example".into(),
         },
     );
 
@@ -126,6 +127,33 @@ async fn test_sts_auth_accepts_verified_token() {
     // live Postgres pool, so the test stops at the auth outcome.
     let response = expect_message!(client.read().await, Authentication);
     assert!(matches!(response, Authentication::Ok));
+}
+
+/// A cached verdict from before an `sts_server_id` rotation must not
+/// authenticate the client: the token was verified against the old
+/// audience and has to go through full verification again.
+#[tokio::test]
+async fn test_sts_auth_rejects_cached_token_after_audience_rotation() {
+    let token = "presigned-sts-token-verified-under-old-audience";
+    StsTokenCache::global().insert(
+        token,
+        ValidatedStsToken {
+            arn: format!(
+                "arn:aws:sts::123456789012:assumed-role/{}/session",
+                "app-service-role"
+            ),
+            normalized_arn: STS_ALLOWED_ROLE.into(),
+            expires_at: SystemTime::now() + Duration::from_secs(300),
+            server_id: "old-audience".into(),
+        },
+    );
+
+    // login_sts configures sts_server_id = "pgdog-example": the cached
+    // verdict is stale and re-verification of this non-URL token fails.
+    let mut client = login_sts(token).await;
+    let error = ErrorResponse::try_from(client.read().await).unwrap();
+    assert_eq!(error.code, "28000");
+    client.join().await;
 }
 
 /// A verified token whose caller identity is not in this user's
@@ -139,6 +167,7 @@ async fn test_sts_auth_rejects_arn_not_in_allowed_list() {
             arn: "arn:aws:sts::123456789012:assumed-role/other-role/session".into(),
             normalized_arn: "arn:aws:iam::123456789012:role/other-role".into(),
             expires_at: SystemTime::now() + Duration::from_secs(300),
+            server_id: "pgdog-example".into(),
         },
     );
 
