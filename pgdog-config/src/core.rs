@@ -156,7 +156,16 @@ impl ConfigAndUsers {
                 continue;
             }
 
-            let sts_server_id = self.config.general.sts_server_id.as_deref().unwrap_or("");
+            // Trim: a whitespace-only value would end up in the signed
+            // `x-pgdog-server-id` header where it can never match a real
+            // audience, so it's as good as unset.
+            let sts_server_id = self
+                .config
+                .general
+                .sts_server_id
+                .as_deref()
+                .unwrap_or("")
+                .trim();
             if sts_server_id.is_empty() {
                 return Err(Error::ParseError(format!(
                     r#"user "{}" (database "{}") has "allowed_iam_arns" but "sts_server_id" is not set in the [general] section"#,
@@ -1600,8 +1609,15 @@ shard = 0
 
     #[test]
     fn test_allowed_iam_arns_requires_sts_server_id() {
-        // Unset and empty `sts_server_id` are both rejected.
-        for sts_server_id in [None, Some(String::new())] {
+        // Unset, empty, and whitespace-only `sts_server_id` are all
+        // rejected: a whitespace-only value would go into the signed
+        // audience header where it can never match.
+        for sts_server_id in [
+            None,
+            Some(String::new()),
+            Some("   ".into()),
+            Some(" \t\n ".into()),
+        ] {
             let mut config = ConfigAndUsers::default();
             config.config.general.sts_server_id = sts_server_id;
             config.users.users.push(crate::User {
