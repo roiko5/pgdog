@@ -3,7 +3,7 @@ use std::env;
 use std::fmt::Display;
 use std::path::PathBuf;
 use std::sync::LazyLock;
-use tracing::warn;
+use tracing::{info, warn};
 
 use super::core::Config;
 use super::pooling::PoolerMode;
@@ -50,8 +50,17 @@ impl Users {
     /// Run configuration checks.
     pub fn check(&mut self, config: &Config) {
         for user in &mut self.users {
+            if !user.allowed_iam_arns.is_empty() {
+                info!(
+                    r#"user "{}" (database "{}") uses STS client auth ({} allowed IAM ARNs)"#,
+                    user.name,
+                    user.database,
+                    user.allowed_iam_arns.len(),
+                );
+            }
+
             if user.passwords().is_empty() {
-                if !config.general.passthrough_auth() && user.identity.is_none() {
+                if !user.has_client_auth(config) {
                     warn!(
                         r#"user "{}" (database "{}") doesn't have a password, passthrough auth and mTLS are disabled"#,
                         user.name, user.database,
@@ -462,6 +471,18 @@ impl User {
     pub fn is_external_identity(&self) -> bool {
         self.server_auth.is_external_identity()
     }
+
+    /// Whether clients have at least one way to authenticate as this user:
+    /// a configured password, passthrough auth, an mTLS identity, or STS
+    /// client auth via `allowed_iam_arns`.
+    ///
+    /// Mirrors the pool-launch gate in `pgdog::backend::databases`.
+    pub fn has_client_auth(&self, config: &Config) -> bool {
+        !self.passwords().is_empty()
+            || config.general.passthrough_auth()
+            || self.identity.is_some()
+            || !self.allowed_iam_arns.is_empty()
+    }
 }
 
 /// Admin database settings control access to the [admin](https://docs.pgdog.dev/administration/) database which contains real time statistics about internal operations of PgDog.
@@ -599,6 +620,39 @@ mod tests {
             .find(|u| u.name == "bob" && u.database == "source_db")
             .unwrap();
         assert_eq!(bob_source.password(), "pass4");
+    }
+
+    #[test]
+    fn test_has_client_auth_counts_sts_as_an_auth_method() {
+        use crate::PassthroughAuth;
+
+        let mut config = Config::default();
+
+        // No password, no mTLS identity, no allowed IAM ARNs: clients have
+        // no way in, so the startup warning is deserved.
+        let mut user = User {
+            name: "issues_service".into(),
+            database: "pool".into(),
+            ..Default::default()
+        };
+        assert!(!user.has_client_auth(&config));
+
+        // An STS-only user is fully configured and must not be warned about.
+        user.allowed_iam_arns = vec!["arn:aws:iam::123456789012:role/app-service-role".into()];
+        assert!(user.has_client_auth(&config));
+
+        // The other three auth methods still count.
+        user.allowed_iam_arns.clear();
+        user.password = Some("secret".into());
+        assert!(user.has_client_auth(&config));
+
+        user.password = None;
+        user.identity = Some("CN=app".into());
+        assert!(user.has_client_auth(&config));
+
+        user.identity = None;
+        config.general.passthrough_auth = PassthroughAuth::EnabledPlain;
+        assert!(user.has_client_auth(&config));
     }
 
     #[test]
