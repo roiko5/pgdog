@@ -1459,8 +1459,6 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn verify_rejects_when_verification_slots_stay_exhausted() {
-        // The paused clock auto-advances through the bounded wait, so
-        // the timeout fires without real elapsed time.
         let permits = hold_all_inflight_permits();
 
         // Precheck-valid token: the rejection must come from the cap,
@@ -1477,8 +1475,6 @@ mod tests {
             .unwrap_err();
         assert_eq!(err, StsAuthError::TooManyVerifications);
 
-        // Saturation is the pooler's state, not the token's: a retry
-        // may succeed as soon as a slot frees.
         assert!(cache.negative.lock().is_empty());
 
         // Releasing the permits frees every slot again.
@@ -1494,8 +1490,6 @@ mod tests {
         // Let the waiter join the semaphore queue before a slot frees.
         tokio::task::yield_now().await;
 
-        // One verification finishing hands its slot to the waiter instead
-        // of the waiter being rejected.
         drop(permits.pop());
         waiter.await.unwrap().unwrap();
 
@@ -1516,8 +1510,7 @@ mod tests {
 
     #[test]
     fn cap_covers_a_full_client_pool_burst() {
-        // A client-side pool opens every connection at once on cold
-        // start, each with a fresh token; common pool sizes reach 50.
+        // Common client-side pool sizes reach 50 connections.
         assert!(MAX_INFLIGHT_VERIFICATIONS >= 50);
     }
 

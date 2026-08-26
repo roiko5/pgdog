@@ -131,8 +131,7 @@ async fn test_sts_auth_overload_returns_capacity_error() {
     let permits = crate::auth::sts::hold_all_inflight_permits();
     let before = failure_count("sts_verification_overloaded");
 
-    // Precheck-valid presigned URL dated now: the rejection must come
-    // from the saturated cap, not from precheck.
+    // Precheck-valid URL dated now: the rejection must come from the cap.
     let date = chrono::Utc::now().format("%Y%m%dT%H%M%SZ");
     let token = format!(
         "https://sts.us-east-1.amazonaws.com/?Action=GetCallerIdentity\

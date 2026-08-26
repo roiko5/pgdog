@@ -107,8 +107,6 @@ mod tests {
         let result = AuthResult::StsVerificationOverloaded;
 
         assert!(!result.is_ok());
-        // Folding overload into "sts_token_rejected" would make a
-        // capacity problem look like an authentication problem.
         assert_eq!(result.reason(), "sts_verification_overloaded");
         assert_ne!(result.reason(), AuthResult::NoStsToken.reason());
     }
