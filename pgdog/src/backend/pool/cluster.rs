@@ -50,6 +50,7 @@ pub struct Cluster {
     identifier: Arc<DatabaseUser>,
     shards: Vec<Shard>,
     passwords: Vec<PasswordKind>,
+    allowed_iam_arns: Vec<String>,
     pooler_mode: PoolerMode,
     sharded_tables: ShardedTables,
     sharded_schemas: ShardedSchemas,
@@ -99,6 +100,7 @@ impl Default for Cluster {
             identifier: Default::default(),
             shards: Default::default(),
             passwords: Default::default(),
+            allowed_iam_arns: Default::default(),
             pooler_mode: Default::default(),
             sharded_tables: Default::default(),
             sharded_schemas: Default::default(),
@@ -187,6 +189,7 @@ pub struct ClusterConfig<'a> {
     lb_strategy: LoadBalancingStrategy,
     user: &'a str,
     passwords: Vec<PasswordKind>,
+    allowed_iam_arns: &'a [String],
     pooler_mode: PoolerMode,
     sharded_tables: ShardedTables,
     multi_tenant: &'a Option<MultiTenant>,
@@ -249,6 +252,7 @@ impl<'a> ClusterConfig<'a> {
         Self {
             name: &user.database,
             passwords: user.passwords(),
+            allowed_iam_arns: &user.allowed_iam_arns,
             user: &user.name,
             pooler_mode,
             lb_strategy: general.load_balancing_strategy,
@@ -304,6 +308,7 @@ impl Cluster {
             lb_strategy,
             user,
             passwords,
+            allowed_iam_arns,
             pooler_mode,
             sharded_tables,
             multi_tenant,
@@ -371,6 +376,7 @@ impl Cluster {
                 })
                 .collect(),
             passwords,
+            allowed_iam_arns: allowed_iam_arns.to_vec(),
             pooler_mode,
             sharded_tables,
             sharded_schemas,
@@ -467,6 +473,12 @@ impl Cluster {
 
     pub fn passwords(&self) -> &[PasswordKind] {
         &self.passwords
+    }
+
+    /// IAM role ARNs allowed to authenticate as this user with a presigned
+    /// AWS STS token. Non-empty enables STS client authentication.
+    pub fn allowed_iam_arns(&self) -> &[String] {
+        &self.allowed_iam_arns
     }
 
     /// Get user identity which should match the TLS certificate it provided

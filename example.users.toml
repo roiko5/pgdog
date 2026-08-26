@@ -38,6 +38,25 @@ password = "pgdog"
 # Independent of `server_auth` below; combine it with any backend authentication method.
 # vault_path = "database/static-creds/alice"
 
+# Example: client authentication with a presigned AWS STS token.
+# Instead of a password, the client sends a presigned STS GetCallerIdentity URL
+# (SigV4 query-signed, valid for at most 900 seconds) with the `x-pgdog-server-id`
+# header — set to `sts_server_id` from pgdog.toml — included in its signed headers.
+# The URL must be signed for GET: STS is a Query-protocol service, so SDKs
+# presign GetCallerIdentity for POST by default, and PgDog replays the URL as a
+# GET — a POST-signed URL always fails with SignatureDoesNotMatch. In botocore,
+# pass HttpMethod="GET" to generate_presigned_url.
+# PgDog executes the URL against STS and lets the client in only if the verified
+# caller identity matches one of these IAM role ARNs (assumed-role ARNs are
+# normalized to the IAM role they were assumed from before matching).
+# Entries must be the path-less role ARN exactly as it appears in assumed-role
+# ARNs (arn:aws:iam::<account>:role/<Name>); a path-qualified entry
+# (role/some/path/<Name>) can never match because STS drops the path.
+# The token is a short-lived bearer credential sent as a cleartext password,
+# so also enable `tls_client_required` in pgdog.toml.
+# Requires `sts_server_id` to be set in the [general] section of pgdog.toml.
+# allowed_iam_arns = ["arn:aws:iam::123456789012:role/my-app-role"]
+
 # Example: backend authentication with a HashiCorp Vault static role.
 # Requires the [vault] section in pgdog.toml.
 # server_user = "pgdog_service"

@@ -11,7 +11,8 @@ use tokio::select;
 use tracing::{info, warn};
 
 use super::{
-    Clients, ClientsLocked, Listeners, LookupMetrics, MirrorStatsMetrics, Pools, QueryCache, TwoPc,
+    ClientAuth, Clients, ClientsLocked, Listeners, LookupMetrics, MirrorStatsMetrics, Pools,
+    QueryCache, TwoPc,
 };
 use crate::tasks;
 
@@ -41,6 +42,7 @@ async fn metrics(_: Request<hyper::body::Incoming>) -> Result<Response<Full<Byte
         .collect();
     let query_cache = query_cache.join("\n");
     let two_pc = TwoPc::load();
+    let client_auth = ClientAuth::load();
     let metrics_data = clients.to_string()
         + "\n"
         + &clients_locked.to_string()
@@ -55,7 +57,9 @@ async fn metrics(_: Request<hyper::body::Incoming>) -> Result<Response<Full<Byte
         + "\n"
         + &query_cache
         + "\n"
-        + &two_pc.to_string();
+        + &two_pc.to_string()
+        + "\n"
+        + &client_auth.to_string();
     let response = Response::builder()
         .header(
             hyper::header::CONTENT_TYPE,

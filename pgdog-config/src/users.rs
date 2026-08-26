@@ -3,7 +3,7 @@ use std::env;
 use std::fmt::Display;
 use std::path::PathBuf;
 use std::sync::LazyLock;
-use tracing::warn;
+use tracing::{info, warn};
 
 use super::core::Config;
 use super::pooling::PoolerMode;
@@ -50,8 +50,17 @@ impl Users {
     /// Run configuration checks.
     pub fn check(&mut self, config: &Config) {
         for user in &mut self.users {
+            if !user.allowed_iam_arns.is_empty() {
+                info!(
+                    r#"user "{}" (database "{}") uses STS client auth ({} allowed IAM ARNs)"#,
+                    user.name,
+                    user.database,
+                    user.allowed_iam_arns.len(),
+                );
+            }
+
             if user.passwords().is_empty() {
-                if !config.general.passthrough_auth() && user.identity.is_none() {
+                if !user.has_client_auth(config) {
                     warn!(
                         r#"user "{}" (database "{}") doesn't have a password, passthrough auth and mTLS are disabled"#,
                         user.name, user.database,
@@ -337,6 +346,20 @@ pub struct User {
     /// current password from Vault and compares it to what the client
     /// provides instead of using a statically configured password.
     pub vault_path: Option<String>,
+    /// IAM role ARNs allowed to authenticate as this user via AWS STS client
+    /// authentication. Clients present a presigned STS GetCallerIdentity URL as
+    /// their password; the caller's role ARN must match one of these entries.
+    /// Entries must be the path-less role ARN exactly as it appears in
+    /// assumed-role ARNs (`arn:aws:iam::<account>:role/<Name>`); a
+    /// path-qualified entry (`role/some/path/<Name>`) can never match because
+    /// STS drops the path from assumed-role ARNs.
+    ///
+    /// **Note:** Requires `sts_server_id` to be set in the `[general]` section
+    /// of `pgdog.toml`.
+    ///
+    /// _Default:_ `[]` (STS client authentication disabled for this user)
+    #[serde(default)]
+    pub allowed_iam_arns: Vec<String>,
     /// Statement timeout.
     ///
     /// Sets the `statement_timeout` on all server connections at connection creation. This allows you to set a reasonable default for each user without modifying `postgresql.conf` or using `ALTER USER`.
@@ -447,6 +470,18 @@ impl User {
 
     pub fn is_external_identity(&self) -> bool {
         self.server_auth.is_external_identity()
+    }
+
+    /// Whether clients have at least one way to authenticate as this user:
+    /// a configured password, passthrough auth, an mTLS identity, or STS
+    /// client auth via `allowed_iam_arns`.
+    ///
+    /// Mirrors the pool-launch gate in `pgdog::backend::databases`.
+    pub fn has_client_auth(&self, config: &Config) -> bool {
+        !self.passwords().is_empty()
+            || config.general.passthrough_auth()
+            || self.identity.is_some()
+            || !self.allowed_iam_arns.is_empty()
     }
 }
 
@@ -585,6 +620,39 @@ mod tests {
             .find(|u| u.name == "bob" && u.database == "source_db")
             .unwrap();
         assert_eq!(bob_source.password(), "pass4");
+    }
+
+    #[test]
+    fn test_has_client_auth_counts_sts_as_an_auth_method() {
+        use crate::PassthroughAuth;
+
+        let mut config = Config::default();
+
+        // No password, no mTLS identity, no allowed IAM ARNs: clients have
+        // no way in, so the startup warning is deserved.
+        let mut user = User {
+            name: "issues_service".into(),
+            database: "pool".into(),
+            ..Default::default()
+        };
+        assert!(!user.has_client_auth(&config));
+
+        // An STS-only user is fully configured and must not be warned about.
+        user.allowed_iam_arns = vec!["arn:aws:iam::123456789012:role/app-service-role".into()];
+        assert!(user.has_client_auth(&config));
+
+        // The other three auth methods still count.
+        user.allowed_iam_arns.clear();
+        user.password = Some("secret".into());
+        assert!(user.has_client_auth(&config));
+
+        user.password = None;
+        user.identity = Some("CN=app".into());
+        assert!(user.has_client_auth(&config));
+
+        user.identity = None;
+        config.general.passthrough_auth = PassthroughAuth::EnabledPlain;
+        assert!(user.has_client_auth(&config));
     }
 
     #[test]

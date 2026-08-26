@@ -14,7 +14,7 @@ use tracing::{Level as LogLevel, debug, enabled, error, info, trace, warn};
 
 use super::{ClientRequest, Error, PreparedStatements};
 use crate::auth::AuthResult;
-use crate::auth::{md5, scram::Server};
+use crate::auth::{md5, scram::Server, sts};
 use crate::backend::maintenance_mode;
 use crate::backend::pool::stats::MemoryStats;
 use crate::backend::{
@@ -239,6 +239,40 @@ impl Client {
         Ok(result)
     }
 
+    /// Authenticate a client that presents a presigned AWS STS
+    /// `GetCallerIdentity` URL as its password, mapping the verified
+    /// caller identity against the user's `allowed_iam_arns`.
+    async fn check_sts_token(
+        stream: &mut Stream,
+        user: &str,
+        server_id: &str,
+        allowed: &[String],
+    ) -> Result<AuthResult, Error> {
+        stream
+            .send_flush(&Authentication::ClearTextPassword)
+            .await?;
+        let response = Password::from_bytes(stream.read().await?.to_bytes())?;
+
+        let Some(token) = response.password() else {
+            return Ok(AuthResult::NoPasswordMessage);
+        };
+
+        let result =
+            match sts::verify(token, server_id, allowed, sts::StsTokenCache::global()).await {
+                Ok(validated) => {
+                    debug!(user, arn = validated.normalized_arn, "STS client auth ok");
+                    AuthResult::Ok
+                }
+                Err(err) => {
+                    // `err` never contains the token itself.
+                    warn!(r#"user "{}" STS token verification failed: {}"#, user, err);
+                    AuthResult::NoStsToken
+                }
+            };
+
+        Ok(result)
+    }
+
     /// Create new frontend client from the given TCP stream.
     async fn login(
         mut stream: Stream,
@@ -257,6 +291,13 @@ impl Client {
         let admin = database == config.config.admin.name && config.config.admin.user == user;
         let admin_password = &config.config.admin.password;
         let auth_type = &config.config.general.auth_type;
+        // Empty string is treated as unset, mirroring config validation.
+        let sts_server_id = config
+            .config
+            .general
+            .sts_server_id
+            .as_deref()
+            .filter(|id| !id.is_empty());
         let passthrough = config.config.general.passthrough_auth();
         let id = FrontendPid::new();
         let key = BackendKeyData::new_frontend(protocol_version, id);
@@ -271,6 +312,10 @@ impl Client {
         //
         // This is likely because passthrough authentication is enabled.
         //
+        // STS client auth reuses the regular password exchange (the presigned
+        // URL arrives in the password field), so the connect log needs its own
+        // record of the method — `auth_type` alone can't distinguish it.
+        let mut sts_auth = false;
         let auth_result = if admin {
             // The admin database is virtual and never present in the cluster
             // map, so authenticate directly against the configured admin password.
@@ -316,6 +361,19 @@ impl Client {
                         // Asked for a certificate and declined. Users that opt out
                         // fall through to password authentication instead.
                         AuthResult::NoClientCertificate
+                    } else if let Some(server_id) = sts_server_id
+                        && !cluster.allowed_iam_arns().is_empty()
+                    {
+                        // STS client auth: the password is a presigned
+                        // AWS STS GetCallerIdentity URL.
+                        sts_auth = true;
+                        Self::check_sts_token(
+                            &mut stream,
+                            user,
+                            server_id,
+                            cluster.allowed_iam_arns(),
+                        )
+                        .await?
                     } else {
                         // Resolve Vault static role
                         // entries to plaintext before the auth exchange
@@ -330,6 +388,9 @@ impl Client {
         };
 
         if !auth_result.is_ok() {
+            // The reason is only for logs and metrics; the client gets the
+            // same uniform auth error no matter which check failed.
+            crate::stats::client_auth::record_failure(auth_result.reason());
             if log_connections {
                 warn!(
                     r#"user "{}" and database "{}" auth error: {}"#,
@@ -396,11 +457,7 @@ impl Client {
                 user,
                 database,
                 addr,
-                if passthrough {
-                    "passthrough".into()
-                } else {
-                    auth_type.to_string()
-                },
+                auth_method_label(passthrough, sts_auth, auth_type),
                 if stream.is_tls() { "🔒" } else { "" }
             );
         }
@@ -721,6 +778,19 @@ impl Drop for Client {
     }
 }
 
+/// Label for the connect log naming the authentication method that actually
+/// ran. STS is wire-compatible with regular password auth, so the configured
+/// `auth_type` would mislabel STS connections as e.g. `scram`.
+fn auth_method_label(passthrough: bool, sts: bool, auth_type: &AuthType) -> String {
+    if passthrough {
+        "passthrough".into()
+    } else if sts {
+        "sts".into()
+    } else {
+        auth_type.to_string()
+    }
+}
+
 #[cfg(test)]
 impl Client {
     pub async fn spawn_test(mut self) {
@@ -746,6 +816,26 @@ impl MemoryUsage for Client {
 
 #[cfg(test)]
 pub mod test;
+
+#[cfg(test)]
+mod auth_method_label_tests {
+    use super::{AuthType, auth_method_label};
+
+    #[test]
+    fn sts_connections_are_labeled_sts_not_the_wire_auth_type() {
+        // The STS handshake is SCRAM/plain-shaped on the wire, but the log
+        // must say which method actually authenticated the client.
+        assert_eq!(auth_method_label(false, true, &AuthType::Scram), "sts");
+        assert_eq!(auth_method_label(false, true, &AuthType::Plain), "sts");
+
+        // Non-STS connections keep their existing labels.
+        assert_eq!(auth_method_label(false, false, &AuthType::Scram), "scram");
+        assert_eq!(
+            auth_method_label(true, false, &AuthType::Scram),
+            "passthrough"
+        );
+    }
+}
 
 #[cfg(test)]
 mod client_certificate_tests {
