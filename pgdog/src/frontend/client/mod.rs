@@ -263,6 +263,11 @@ impl Client {
                     debug!(user, arn = validated.normalized_arn, "STS client auth ok");
                     AuthResult::Ok
                 }
+                Err(sts::StsAuthError::TooManyVerifications) => {
+                    // Not a verdict on the token: no slot freed up in time.
+                    warn!(r#"user "{}" STS verification capacity exhausted"#, user);
+                    AuthResult::StsVerificationOverloaded
+                }
                 Err(err) => {
                     // `err` never contains the token itself.
                     warn!(r#"user "{}" STS token verification failed: {}"#, user, err);
@@ -388,8 +393,7 @@ impl Client {
         };
 
         if !auth_result.is_ok() {
-            // The reason is only for logs and metrics; the client gets the
-            // same uniform auth error no matter which check failed.
+            // The reason is only for logs and metrics.
             crate::stats::client_auth::record_failure(auth_result.reason());
             if log_connections {
                 warn!(
@@ -397,7 +401,16 @@ impl Client {
                     user, database, auth_result
                 );
             }
-            stream.fatal(ErrorResponse::auth(user, database)).await?;
+            // Credential verdicts share one uniform error so the outcome
+            // leaks nothing about which check failed. Overload is not a
+            // verdict: the client gets a retryable capacity error instead
+            // of "wrong password".
+            let error = if matches!(auth_result, AuthResult::StsVerificationOverloaded) {
+                ErrorResponse::auth_overloaded(user, database)
+            } else {
+                ErrorResponse::auth(user, database)
+            };
+            stream.fatal(error).await?;
             return Ok(None);
         } else {
             stream.send(&Authentication::Ok).await?;
