@@ -107,6 +107,14 @@
           "type": "boolean",
           "default": false
         },
+        "allowed_iam_arns": {
+          "description": "IAM role ARNs allowed to authenticate as this user via AWS STS client\nauthentication. Clients present a presigned STS GetCallerIdentity URL as\ntheir password; the caller's role ARN must match one of these entries.\nEntries must be the path-less role ARN exactly as it appears in\nassumed-role ARNs (`arn:aws:iam::<account>:role/<Name>`); a\npath-qualified entry (`role/some/path/<Name>`) can never match because\nSTS drops the path from assumed-role ARNs.\n\n**Note:** Requires `sts_server_id` to be set in the `[general]` section\nof `pgdog.toml`.\n\n_Default:_ `[]` (STS client authentication disabled for this user)",
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
         "cross_shard_disabled": {
           "description": "Disable cross-shard queries for this user.",
           "type": [

@@ -121,6 +121,7 @@ impl ConfigAndUsers {
         self.users.check(&self.config);
         self.validate_server_auth()?;
         self.validate_database_tls()?;
+        self.validate_sts_client_auth()?;
         Ok(())
     }
 
@@ -162,6 +163,52 @@ impl ConfigAndUsers {
             return Err(Error::ParseError(
                 "\"tls_verify\" cannot be \"disabled\" when any user has \"server_auth = \\\"rds_iam\\\"\", \"server_auth = \\\"azure_workload_identity\\\"\" or \"server_auth = \\\"vault\\\"\"".into(),
             ));
+        }
+
+        Ok(())
+    }
+
+    fn validate_sts_client_auth(&self) -> Result<(), Error> {
+        for user in &self.users.users {
+            if user.allowed_iam_arns.is_empty() {
+                continue;
+            }
+
+            // Trim: a whitespace-only value would end up in the signed
+            // `x-pgdog-server-id` header where it can never match a real
+            // audience, so it's as good as unset.
+            let sts_server_id = self
+                .config
+                .general
+                .sts_server_id
+                .as_deref()
+                .unwrap_or("")
+                .trim();
+            if sts_server_id.is_empty() {
+                return Err(Error::ParseError(format!(
+                    r#"user "{}" (database "{}") has "allowed_iam_arns" but "sts_server_id" is not set in the [general] section"#,
+                    user.name, user.database
+                )));
+            }
+
+            if self.config.general.passthrough_auth != PassthroughAuth::Disabled {
+                return Err(Error::ParseError(
+                    "\"passthrough_auth\" must be \"disabled\" when any user has \"allowed_iam_arns\"".into(),
+                ));
+            }
+
+            for arn in &user.allowed_iam_arns {
+                let iam_role = arn.starts_with("arn:aws:iam::") && arn.contains(":role/");
+                let assumed_role =
+                    arn.starts_with("arn:aws:sts::") && arn.contains(":assumed-role/");
+
+                if !iam_role && !assumed_role {
+                    return Err(Error::ParseError(format!(
+                        r#"user "{}" (database "{}") has an invalid "allowed_iam_arns" entry "{}": expected "arn:aws:iam::<account>:role/<name>" or "arn:aws:sts::<account>:assumed-role/<name>/<session>""#,
+                        user.name, user.database, arn
+                    )));
+                }
+            }
         }
 
         Ok(())
@@ -1697,6 +1744,132 @@ shard = 0
         let err = config.check().unwrap_err().to_string();
         assert!(err.contains("tls_verify"));
         assert!(err.contains("azure_workload_identity"));
+    }
+
+    #[test]
+    fn test_allowed_iam_arns_requires_sts_server_id() {
+        // Unset, empty, and whitespace-only `sts_server_id` are all
+        // rejected: a whitespace-only value would go into the signed
+        // audience header where it can never match.
+        for sts_server_id in [
+            None,
+            Some(String::new()),
+            Some("   ".into()),
+            Some(" \t\n ".into()),
+        ] {
+            let mut config = ConfigAndUsers::default();
+            config.config.general.sts_server_id = sts_server_id;
+            config.users.users.push(crate::User {
+                name: "alice".into(),
+                database: "db".into(),
+                allowed_iam_arns: vec!["arn:aws:iam::123456789012:role/some-role".into()],
+                ..Default::default()
+            });
+
+            let err = config.check().unwrap_err().to_string();
+            assert!(err.contains("allowed_iam_arns"));
+            assert!(err.contains("sts_server_id"));
+        }
+    }
+
+    #[test]
+    fn test_allowed_iam_arns_rejects_passthrough_auth() {
+        let mut config = ConfigAndUsers::default();
+        config.config.general.sts_server_id = Some("pgdog-example".into());
+        config.config.general.passthrough_auth = PassthroughAuth::Enabled;
+        config.users.users.push(crate::User {
+            name: "alice".into(),
+            database: "db".into(),
+            allowed_iam_arns: vec!["arn:aws:iam::123456789012:role/some-role".into()],
+            ..Default::default()
+        });
+
+        let err = config.check().unwrap_err().to_string();
+        assert!(err.contains("passthrough_auth"));
+        assert!(err.contains("allowed_iam_arns"));
+    }
+
+    #[test]
+    fn test_allowed_iam_arns_rejects_malformed_arns() {
+        for bad in [
+            "not-an-arn",
+            "arn:aws:iam::123456789012:user/bob",
+            "arn:aws:sts::123456789012:role/some-role",
+            "arn:aws:iam::123456789012:assumed-role/some-role/session",
+            "arn:aws:s3:::bucket",
+            "",
+        ] {
+            let mut config = ConfigAndUsers::default();
+            config.config.general.sts_server_id = Some("pgdog-example".into());
+            config.users.users.push(crate::User {
+                name: "alice".into(),
+                database: "db".into(),
+                allowed_iam_arns: vec![bad.into()],
+                ..Default::default()
+            });
+
+            let err = config.check().unwrap_err().to_string();
+            assert!(
+                err.contains("allowed_iam_arns"),
+                "expected error for {bad:?}, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_allowed_iam_arns_accepts_valid_config() {
+        let mut config = ConfigAndUsers::default();
+        config.config.general.sts_server_id = Some("pgdog-example".into());
+        config.users.users.push(crate::User {
+            name: "alice".into(),
+            database: "db".into(),
+            allowed_iam_arns: vec![
+                "arn:aws:iam::123456789012:role/app-service-role".into(),
+                "arn:aws:sts::123456789012:assumed-role/some-role/session".into(),
+            ],
+            ..Default::default()
+        });
+
+        config.check().unwrap();
+    }
+
+    #[test]
+    fn test_sts_server_id_parses_from_toml() {
+        let source = r#"
+[general]
+sts_server_id = "pgdog-example"
+"#;
+        let config: Config = toml::from_str(source).unwrap();
+        assert_eq!(
+            config.general.sts_server_id.as_deref(),
+            Some("pgdog-example")
+        );
+
+        let config: Config = toml::from_str("[general]").unwrap();
+        assert_eq!(config.general.sts_server_id, None);
+    }
+
+    #[test]
+    fn test_allowed_iam_arns_parses_from_toml_and_defaults_empty() {
+        let source = r#"
+[[users]]
+name = "app_rw"
+database = "pool"
+allowed_iam_arns = ["arn:aws:iam::123456789012:role/app-service-role"]
+"#;
+        let users: crate::Users = toml::from_str(source).unwrap();
+        assert_eq!(
+            users.users[0].allowed_iam_arns,
+            vec!["arn:aws:iam::123456789012:role/app-service-role".to_string()]
+        );
+
+        let source = r#"
+[[users]]
+name = "alice"
+database = "db"
+"#;
+        let users: crate::Users = toml::from_str(source).unwrap();
+        assert!(users.users[0].allowed_iam_arns.is_empty());
     }
 
     #[test]

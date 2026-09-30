@@ -117,6 +117,7 @@
         "shutdown_termination_timeout": null,
         "shutdown_timeout": 60000,
         "stats_period": 15000,
+        "sts_server_id": null,
         "system_catalogs": "omnisharded_sticky",
         "tls_certificate": null,
         "tls_client_ca_certificate": null,
@@ -1292,6 +1293,13 @@
           "format": "uint64",
           "default": 15000,
           "minimum": 0
+        },
+        "sts_server_id": {
+          "description": "Audience identifier for AWS STS client authentication. Clients sign this value\ninto the `x-pgdog-server-id` header of the presigned STS GetCallerIdentity URL\nthey present as their password.\n\n**Note:** Required when any user sets `allowed_iam_arns` in `users.toml`.\n\n_Default:_ `None` (STS client authentication disabled)",
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "system_catalogs": {
           "description": "Changes how system catalog tables (like `pg_database`, `pg_class`, etc.) are treated by the query router.\n\n_Default:_ `omnisharded_sticky`\n\n<https://docs.pgdog.dev/configuration/pgdog.toml/general/#system_catalogs>",

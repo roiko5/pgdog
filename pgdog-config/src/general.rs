@@ -575,6 +575,15 @@ pub struct General {
     #[serde(default)]
     pub auth_type: AuthType,
 
+    /// Audience identifier for AWS STS client authentication. Clients sign this value
+    /// into the `x-pgdog-server-id` header of the presigned STS GetCallerIdentity URL
+    /// they present as their password.
+    ///
+    /// **Note:** Required when any user sets `allowed_iam_arns` in `users.toml`.
+    ///
+    /// _Default:_ `None` (STS client authentication disabled)
+    pub sts_server_id: Option<String>,
+
     /// Disable cross-shard queries globally. When enabled, queries touching more than one shard are rejected.
     #[serde(default)]
     pub cross_shard_disabled: bool,
@@ -967,6 +976,7 @@ impl Default for General {
             mirror_queue: Self::mirror_queue(),
             mirror_exposure: Self::mirror_exposure(),
             auth_type: Self::auth_type(),
+            sts_server_id: None,
             cross_shard_disabled: Self::cross_shard_disabled(),
             dns_ttl: Self::default_dns_ttl(),
             pub_sub_channel_size: Self::pub_sub_channel_size(),
