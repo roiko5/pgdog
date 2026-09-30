@@ -513,7 +513,7 @@ impl Cluster {
 
     /// IAM role ARNs allowed to authenticate as this user with a presigned
     /// AWS STS token. Non-empty enables STS client authentication.
-    pub fn allowed_iam_arns(&self) -> &[String] {
+    pub(crate) fn allowed_iam_arns(&self) -> &[String] {
         &self.allowed_iam_arns
     }
 

@@ -16,16 +16,17 @@ use super::{Measurement, Metric, OpenMetric};
 static FAILURES: Lazy<Mutex<HashMap<&'static str, u64>>> = Lazy::new(|| Mutex::new(HashMap::new()));
 
 /// Record one rejected client authentication attempt.
-pub fn record_failure(reason: &'static str) {
+pub(crate) fn record_failure(reason: &'static str) {
     *FAILURES.lock().entry(reason).or_insert(0) += 1;
 }
 
 /// Current failure count for one reason.
-pub fn failure_count(reason: &str) -> u64 {
+#[cfg(test)]
+pub(crate) fn failure_count(reason: &str) -> u64 {
     FAILURES.lock().get(reason).copied().unwrap_or(0)
 }
 
-pub struct ClientAuth;
+pub(crate) struct ClientAuth;
 
 impl ClientAuth {
     pub fn load() -> Metric {

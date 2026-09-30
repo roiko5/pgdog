@@ -25,7 +25,7 @@ use url::Url;
 
 /// Header clients must include in `X-Amz-SignedHeaders`, carrying the
 /// audience value from `sts_server_id` in `pgdog.toml`.
-pub const SERVER_ID_HEADER: &str = "x-pgdog-server-id";
+pub(crate) const SERVER_ID_HEADER: &str = "x-pgdog-server-id";
 
 /// Maximum allowed value of `X-Amz-Expires`, in seconds.
 const MAX_EXPIRES: u64 = 900;
@@ -89,7 +89,7 @@ pub(crate) fn hold_all_inflight_permits() -> Vec<SemaphorePermit<'static>> {
 
 /// Reasons a presigned STS URL fails validation before any I/O happens.
 #[derive(Debug, Clone, Error, PartialEq, Eq)]
-pub enum StsAuthError {
+pub(crate) enum StsAuthError {
     /// The password doesn't parse as a URL.
     #[error("password is not a valid URL")]
     InvalidUrl,
@@ -173,7 +173,7 @@ pub enum StsAuthError {
 /// A presigned STS URL that passed offline validation and is ready to be
 /// executed against STS.
 #[derive(Debug, Clone)]
-pub struct PrecheckedToken {
+pub(crate) struct PrecheckedToken {
     url: Url,
     server_id: String,
     expires_at: SystemTime,
@@ -200,7 +200,7 @@ impl PrecheckedToken {
 /// A token whose presigned URL was executed against STS and mapped to a
 /// caller identity.
 #[derive(Debug, Clone)]
-pub struct ValidatedStsToken {
+pub(crate) struct ValidatedStsToken {
     /// Caller ARN exactly as returned by STS.
     pub arn: String,
     /// Caller ARN after [`normalize_arn`].
@@ -219,7 +219,7 @@ pub struct ValidatedStsToken {
 /// `server_id` is this pooler's `sts_server_id`; it's carried into the
 /// returned token so the caller can send it in the [`SERVER_ID_HEADER`]
 /// header when executing the request.
-pub fn precheck(password: &str, server_id: &str) -> Result<PrecheckedToken, StsAuthError> {
+pub(crate) fn precheck(password: &str, server_id: &str) -> Result<PrecheckedToken, StsAuthError> {
     precheck_at(password, server_id, SystemTime::now())
 }
 
@@ -352,7 +352,7 @@ fn parse_amz_date(date: &str) -> Option<SystemTime> {
 /// `arn:aws:iam::<acct>:role/<RoleName>`
 ///
 /// ARNs that don't match this shape are returned unchanged.
-pub fn normalize_arn(arn: &str) -> String {
+pub(crate) fn normalize_arn(arn: &str) -> String {
     let parsed = arn
         .strip_prefix("arn:aws:sts::")
         .and_then(|rest| rest.split_once(':'))
@@ -370,7 +370,7 @@ pub fn normalize_arn(arn: &str) -> String {
 
 /// Whether a caller ARN matches the user's `allowed_iam_arns` list, either
 /// by its normalized IAM role ARN or by an exact unnormalized match.
-pub fn matches_allowed(normalized: &str, raw: &str, allowed: &[String]) -> bool {
+pub(crate) fn matches_allowed(normalized: &str, raw: &str, allowed: &[String]) -> bool {
     allowed.iter().any(|arn| arn == normalized || arn == raw)
 }
 
@@ -382,7 +382,7 @@ pub fn matches_allowed(normalized: &str, raw: &str, allowed: &[String]) -> bool 
 /// been inserted on behalf of a different user: cache hits skip the STS
 /// round-trip but are re-authorized against `allowed` every time, and are
 /// only served for the audience (`server_id`) they were verified under.
-pub async fn verify(
+pub(crate) async fn verify(
     password: &str,
     server_id: &str,
     allowed: &[String],
@@ -596,7 +596,7 @@ struct CachedRejection {
 /// [`NEGATIVE_CACHE_TTL`]. Expired entries in both maps are pruned on
 /// access (per key on reads, full sweep on inserts), so neither map grows
 /// beyond the distinct tokens seen in one TTL window.
-pub struct StsTokenCache {
+pub(crate) struct StsTokenCache {
     inner: Mutex<HashMap<[u8; 32], CachedValidation>>,
     negative: Mutex<HashMap<[u8; 32], CachedRejection>>,
 }
@@ -1511,7 +1511,7 @@ mod tests {
     #[test]
     fn cap_covers_a_full_client_pool_burst() {
         // Common client-side pool sizes reach 50 connections.
-        assert!(MAX_INFLIGHT_VERIFICATIONS >= 50);
+        const { assert!(MAX_INFLIGHT_VERIFICATIONS >= 50) };
     }
 
     #[tokio::test]

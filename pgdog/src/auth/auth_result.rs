@@ -37,7 +37,7 @@ impl AuthResult {
     /// Stable label for the client auth failure counter, broken down by
     /// reason. Operator-facing only: clients always receive the same
     /// uniform authentication error regardless of which check failed.
-    pub fn reason(&self) -> &'static str {
+    pub(crate) fn reason(&self) -> &'static str {
         match self {
             Self::Ok => "ok",
             Self::NoPasswordMatch => "wrong_password",
